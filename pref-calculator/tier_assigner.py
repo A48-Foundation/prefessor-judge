@@ -26,7 +26,7 @@ def natural_tier(score):
     return max(1, min(6, tier))
 
 
-def assign_tiers(judges_with_scores, quotas):
+def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
     """Assign tiers to judges satisfying quota constraints.
     
     Args:
@@ -34,6 +34,7 @@ def assign_tiers(judges_with_scores, quotas):
             name, school, rounds, score (absolute 1-6)
         quotas: dict of tier -> {"min": int, "max": int}
             e.g., {1: {"min": 10, "max": 20}, 2: {"min": 15, "max": 30}, ...}
+        quota_mode: "rounds" (sum of available rounds) or "judges" (judge count)
     
     Returns:
         list of dicts with added "tier" key, plus a report dict
@@ -49,9 +50,15 @@ def assign_tiers(judges_with_scores, quotas):
         if judge["score"] is not None and judge["score"] - int(judge["score"]) == 0.5:
             judge["is_boundary"] = True
 
-    # Phase 2: Calculate current round totals per tier
-    def tier_rounds(judges, tier):
+    # Phase 2: Measure function based on quota mode
+    def tier_total(judges, tier):
+        if quota_mode == "judges":
+            return sum(1 for j in judges if j["tier"] == tier)
         return sum(j["rounds"] for j in judges if j["tier"] == tier)
+
+    def judge_cost(j):
+        """How much a single judge contributes to the tier total."""
+        return 1 if quota_mode == "judges" else j["rounds"]
 
     # Phase 3: Adjust to meet quotas
     # Strategy: iterate tiers top-down for over-max (push down),
@@ -65,7 +72,7 @@ def assign_tiers(judges_with_scores, quotas):
         for tier in range(1, 6):
             if tier not in quotas:
                 continue
-            current = tier_rounds(sorted_judges, tier)
+            current = tier_total(sorted_judges, tier)
             q = quotas[tier]
             q_max = q.get("max", float("inf"))
 
@@ -76,14 +83,14 @@ def assign_tiers(judges_with_scores, quotas):
                     if current <= q_max:
                         break
                     j["tier"] = tier + 1
-                    current -= j["rounds"]
+                    current -= judge_cost(j)
                     adjustments_made = True
 
         # Pass 2 (bottom-up): push overflow UP from strikes and tier 5
         for tier in range(6, 0, -1):
             if tier not in quotas:
                 continue
-            current = tier_rounds(sorted_judges, tier)
+            current = tier_total(sorted_judges, tier)
             q = quotas[tier]
             q_max = q.get("max", float("inf"))
 
@@ -94,7 +101,7 @@ def assign_tiers(judges_with_scores, quotas):
                 target = tier - 1
                 # Find the nearest tier above that can accept judges
                 while target >= 1:
-                    target_current = tier_rounds(sorted_judges, target)
+                    target_current = tier_total(sorted_judges, target)
                     target_max = quotas.get(target, {}).get("max", float("inf"))
                     if target_current < target_max:
                         break
@@ -110,14 +117,14 @@ def assign_tiers(judges_with_scores, quotas):
                         j["tier"] = max(target, 5)
                     else:
                         j["tier"] = target
-                    current -= j["rounds"]
+                    current -= judge_cost(j)
                     adjustments_made = True
 
         # Pass 3: handle under-min by pulling from tier below
         for tier in range(1, 7):
             if tier not in quotas:
                 continue
-            current = tier_rounds(sorted_judges, tier)
+            current = tier_total(sorted_judges, tier)
             q = quotas[tier]
             q_min = q.get("min", 0)
 
@@ -131,26 +138,28 @@ def assign_tiers(judges_with_scores, quotas):
                     if j["tier"] == 6 and tier < 5:
                         continue
                     j["tier"] = tier
-                    current += j["rounds"]
+                    current += judge_cost(j)
                     adjustments_made = True
 
         if not adjustments_made:
             break
 
     # Build report
-    report = {}
+    report = {"quota_mode": quota_mode}
     for tier in range(1, 7):
-        current = tier_rounds(sorted_judges, tier)
+        total = tier_total(sorted_judges, tier)
         count = sum(1 for j in sorted_judges if j["tier"] == tier)
+        rounds = sum(j["rounds"] for j in sorted_judges if j["tier"] == tier)
         q = quotas.get(tier, {})
         met = True
-        if "min" in q and current < q["min"]:
+        if "min" in q and total < q["min"]:
             met = False
-        if "max" in q and current > q["max"]:
+        if "max" in q and total > q["max"]:
             met = False
         report[tier] = {
             "judges": count,
-            "total_rounds": current,
+            "total_rounds": rounds,
+            "quota_total": total,
             "quota_min": q.get("min", "-"),
             "quota_max": q.get("max", "-"),
             "met": met,
@@ -161,12 +170,15 @@ def assign_tiers(judges_with_scores, quotas):
 
 def format_report(report):
     """Format the tier assignment report as a readable string."""
+    mode = report.get("quota_mode", "rounds")
+    mode_label = "Judges" if mode == "judges" else "Rounds"
     lines = []
-    lines.append(f"{'Tier':<6} {'Judges':<8} {'Rounds':<8} {'Min':<6} {'Max':<6} {'Status'}")
-    lines.append("-" * 46)
+    lines.append(f"Quota mode: {mode_label}")
+    lines.append(f"{'Tier':<6} {'Judges':<8} {'Rounds':<8} {mode_label + ' (quota)':<16} {'Min':<6} {'Max':<6} {'Status'}")
+    lines.append("-" * 60)
     for tier in range(1, 7):
-        r = report.get(tier, {"judges": 0, "total_rounds": 0, "quota_min": "-", "quota_max": "-", "met": True})
+        r = report.get(tier, {"judges": 0, "total_rounds": 0, "quota_total": 0, "quota_min": "-", "quota_max": "-", "met": True})
         label = "S" if tier == 6 else str(tier)
         status = "✓" if r["met"] else "✗ UNMET"
-        lines.append(f"{label:<6} {r['judges']:<8} {r['total_rounds']:<8} {str(r['quota_min']):<6} {str(r['quota_max']):<6} {status}")
+        lines.append(f"{label:<6} {r['judges']:<8} {r['total_rounds']:<8} {r['quota_total']:<16} {str(r['quota_min']):<6} {str(r['quota_max']):<6} {status}")
     return "\n".join(lines)

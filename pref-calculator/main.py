@@ -13,12 +13,29 @@ from tier_assigner import assign_tiers, format_report
 from csv_writer import write_output_csv
 
 
-def get_quotas():
-    """Prompt user for tier quotas (min/max rounds per tier)."""
+def get_quota_mode():
+    """Prompt user for quota mode: rounds or judge count."""
     print("\n" + "=" * 50)
-    print("Enter round quotas for each tier.")
+    print("How does this tournament measure tier quotas?")
+    print("  1. Round count (total available rounds per tier)")
+    print("  2. Judge count (number of judges per tier)")
+    print("=" * 50)
+    while True:
+        raw = input("  Select [1/2]: ").strip()
+        if raw == "1":
+            return "rounds"
+        if raw == "2":
+            return "judges"
+        print("    Please enter 1 or 2.")
+
+
+def get_quotas(quota_mode):
+    """Prompt user for tier quotas (min/max per tier)."""
+    unit = "judges" if quota_mode == "judges" else "rounds"
+    print("\n" + "=" * 50)
+    print(f"Enter {unit} quotas for each tier.")
     print("Format: min,max  (leave blank to skip, use - for no limit)")
-    print("Example: 10,25 means min 10 rounds, max 25 rounds")
+    print(f"Example: 10,25 means min 10 {unit}, max 25 {unit}")
     print("=" * 50)
 
     quotas = {}
@@ -101,15 +118,16 @@ def main():
     for j in all_judges:
         print(f"{j['name']:<30} {j['score']:<8} {j['rounds']:<8}")
 
-    # Get quotas
-    quotas = get_quotas()
+    # Get quota mode and quotas
+    quota_mode = get_quota_mode()
+    quotas = get_quotas(quota_mode)
 
     if not quotas:
         print("\nNo quotas provided. Using natural tier mapping only.")
 
     # Run assignment
     print("\nAssigning tiers...")
-    assigned, report = assign_tiers(all_judges, quotas)
+    assigned, report = assign_tiers(all_judges, quotas, quota_mode)
 
     # Display report
     print(f"\n{'='*50}")
