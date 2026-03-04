@@ -141,7 +141,7 @@ def main():
     print("-" * 60)
     assigned.sort(key=lambda j: (j["tier"], j["score"]))
     for j in assigned:
-        tier_label = "S" if j["tier"] == 6 else str(j["tier"])
+        tier_label = "C" if j["tier"] == 7 else ("S" if j["tier"] == 6 else str(j["tier"]))
         boundary = " *" if j.get("is_boundary") else ""
         print(f"{j['name']:<30} {j['score']:<8} {tier_label:<8} {j['rounds']:<8}{boundary}")
     print("\n* = boundary judge (score ends in .5)")

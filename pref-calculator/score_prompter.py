@@ -12,7 +12,8 @@ def prompt_for_scores(unmatched_judges):
 
     print(f"\n{'='*50}")
     print(f"{len(unmatched_judges)} judge(s) not found in Notion database.")
-    print("Please enter an absolute score (1-6) for each:")
+    print("Please enter an absolute score (1-7) for each:")
+    print("  (6 = Strike, 7 = Conflict/same school)")
     print(f"{'='*50}\n")
 
     for judge in unmatched_judges:
@@ -20,8 +21,8 @@ def prompt_for_scores(unmatched_judges):
             try:
                 raw = input(f"  {judge['name']} ({judge['school']}): ")
                 score = float(raw.strip())
-                if score < 1 or score > 6:
-                    print("    Score must be between 1 and 6.")
+                if score < 1 or score > 7:
+                    print("    Score must be between 1 and 7.")
                     continue
                 # Snap to nearest 0.5
                 score = round(score * 2) / 2

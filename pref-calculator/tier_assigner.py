@@ -6,7 +6,7 @@ import math
 
 
 def natural_tier(score):
-    """Map an absolute score (1-6) to its natural tier (1-6).
+    """Map an absolute score (1-7) to its natural tier (1-7).
     
     1.0-1.5 → Tier 1
     2.0-2.5 → Tier 2
@@ -14,16 +14,19 @@ def natural_tier(score):
     4.0-4.5 → Tier 4
     5.0-5.5 → Tier 5
     6.0      → Tier 6 (strike)
+    7.0      → Tier 7 (conflict)
     """
     if score is None:
         return 4  # fallback
+    if score >= 7:
+        return 7
     tier = math.ceil(score)
     if score == int(score) and score >= 1:
         tier = int(score)
     # x.5 rounds up: 1.5→T1, 2.5→T2, etc. (belongs to lower tier)
     if score - int(score) == 0.5:
         tier = int(score)
-    return max(1, min(6, tier))
+    return max(1, min(7, tier))
 
 
 def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
@@ -50,6 +53,10 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
         if judge["score"] is not None and judge["score"] - int(judge["score"]) == 0.5:
             judge["is_boundary"] = True
 
+    # Separate conflicts (tier 7) — they are excluded from quota logic
+    conflicts = [j for j in sorted_judges if j["tier"] == 7]
+    active_judges = [j for j in sorted_judges if j["tier"] != 7]
+
     # Phase 2: Measure function based on quota mode
     def tier_total(judges, tier):
         if quota_mode == "judges":
@@ -72,12 +79,12 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
         for tier in range(1, 6):
             if tier not in quotas:
                 continue
-            current = tier_total(sorted_judges, tier)
+            current = tier_total(active_judges, tier)
             q = quotas[tier]
             q_max = q.get("max", float("inf"))
 
             if current > q_max:
-                tier_judges = [j for j in sorted_judges if j["tier"] == tier]
+                tier_judges = [j for j in active_judges if j["tier"] == tier]
                 tier_judges.sort(key=lambda j: -j["score"])
                 for j in tier_judges:
                     if current <= q_max:
@@ -90,18 +97,19 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
         for tier in range(6, 0, -1):
             if tier not in quotas:
                 continue
-            current = tier_total(sorted_judges, tier)
+            current = tier_total(active_judges, tier)
             q = quotas[tier]
             q_max = q.get("max", float("inf"))
 
             if current > q_max:
                 # Move best judges in this tier UP to the tier above
-                tier_judges = [j for j in sorted_judges if j["tier"] == tier]
-                tier_judges.sort(key=lambda j: j["score"])
+                # Prefer promoting judges with better scores; keep score>=5 low
+                tier_judges = [j for j in active_judges if j["tier"] == tier]
+                tier_judges.sort(key=lambda j: (1 if j["score"] >= 5.0 else 0, j["score"]))
                 target = tier - 1
                 # Find the nearest tier above that can accept judges
                 while target >= 1:
-                    target_current = tier_total(sorted_judges, target)
+                    target_current = tier_total(active_judges, target)
                     target_max = quotas.get(target, {}).get("max", float("inf"))
                     if target_current < target_max:
                         break
@@ -121,17 +129,18 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
                     adjustments_made = True
 
         # Pass 3: handle under-min by pulling from tier below
+        # Deprioritize score>=5.0 judges — only pull them as last resort
         for tier in range(1, 7):
             if tier not in quotas:
                 continue
-            current = tier_total(sorted_judges, tier)
+            current = tier_total(active_judges, tier)
             q = quotas[tier]
             q_min = q.get("min", 0)
 
             if current < q_min:
                 next_tier = tier + 1
-                next_judges = [j for j in sorted_judges if j["tier"] == next_tier]
-                next_judges.sort(key=lambda j: j["score"])
+                next_judges = [j for j in active_judges if j["tier"] == next_tier]
+                next_judges.sort(key=lambda j: (1 if j["score"] >= 5.0 else 0, j["score"]))
                 for j in next_judges:
                     if current >= q_min:
                         break
@@ -144,12 +153,43 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
         if not adjustments_made:
             break
 
+    # Pass 4: Post-stabilization swap — push score>=5 judges back to tier 5
+    # If a score>=5 judge got promoted above tier 5, try to swap with a
+    # better-scored judge in tier 5 (keeps quotas intact via 1-for-1 swap)
+    promoted_bad = [j for j in active_judges if j["score"] >= 5.0 and j["tier"] < 5]
+    promoted_bad.sort(key=lambda j: -j["score"])  # worst first
+    for bad in promoted_bad:
+        bad_tier = bad["tier"]
+        # Find a swap candidate in tier 5 with a better score
+        candidates = [j for j in active_judges
+                      if j["tier"] == 5 and j["score"] < 5.0]
+        candidates.sort(key=lambda j: j["score"])  # best first
+        for good in candidates:
+            # Swap: move good judge up, bad judge down to 5
+            good["tier"] = bad_tier
+            bad["tier"] = 5
+            # Verify quotas still hold after swap
+            ok = True
+            for t in [bad_tier, 5]:
+                q = quotas.get(t, {})
+                total = tier_total(active_judges, t)
+                if "min" in q and total < q["min"]:
+                    ok = False
+                if "max" in q and total > q["max"]:
+                    ok = False
+            if ok:
+                break  # swap succeeded
+            else:
+                # Revert swap
+                bad["tier"] = bad_tier
+                good["tier"] = 5
+
     # Build report
     report = {"quota_mode": quota_mode}
     for tier in range(1, 7):
-        total = tier_total(sorted_judges, tier)
-        count = sum(1 for j in sorted_judges if j["tier"] == tier)
-        rounds = sum(j["rounds"] for j in sorted_judges if j["tier"] == tier)
+        total = tier_total(active_judges, tier)
+        count = sum(1 for j in active_judges if j["tier"] == tier)
+        rounds = sum(j["rounds"] for j in active_judges if j["tier"] == tier)
         q = quotas.get(tier, {})
         met = True
         if "min" in q and total < q["min"]:
@@ -164,8 +204,17 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
             "quota_max": q.get("max", "-"),
             "met": met,
         }
+    # Conflict tier (no quotas)
+    report[7] = {
+        "judges": len(conflicts),
+        "total_rounds": sum(j["rounds"] for j in conflicts),
+        "quota_total": len(conflicts),
+        "quota_min": "-",
+        "quota_max": "-",
+        "met": True,
+    }
 
-    return sorted_judges, report
+    return active_judges + conflicts, report
 
 
 def format_report(report):
@@ -176,9 +225,16 @@ def format_report(report):
     lines.append(f"Quota mode: {mode_label}")
     lines.append(f"{'Tier':<6} {'Judges':<8} {'Rounds':<8} {mode_label + ' (quota)':<16} {'Min':<6} {'Max':<6} {'Status'}")
     lines.append("-" * 60)
-    for tier in range(1, 7):
+    for tier in range(1, 8):
         r = report.get(tier, {"judges": 0, "total_rounds": 0, "quota_total": 0, "quota_min": "-", "quota_max": "-", "met": True})
-        label = "S" if tier == 6 else str(tier)
+        if tier == 7:
+            label = "C"
+        elif tier == 6:
+            label = "S"
+        else:
+            label = str(tier)
         status = "✓" if r["met"] else "✗ UNMET"
+        if tier == 7:
+            status = "-"  # conflicts don't have quota status
         lines.append(f"{label:<6} {r['judges']:<8} {r['total_rounds']:<8} {r['quota_total']:<16} {str(r['quota_min']):<6} {str(r['quota_max']):<6} {status}")
     return "\n".join(lines)
