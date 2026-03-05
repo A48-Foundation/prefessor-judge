@@ -69,168 +69,298 @@ def natural_tier(score):
     return max(1, min(7, tier))
 
 
+def _find_optimal_partition(rateable, quotas, quota_mode):
+    """Find the optimal partition of sorted judges into tiers satisfying all quotas.
+
+    Judges must be pre-sorted worst→best (highest score first).
+    The partition is sequential: first k5 judges → tier 5, next k4 → tier 4, etc.
+    Searches all valid (k5, k4, k3, k2) combinations; k1 = remainder.
+    Minimises total deviation from natural tiers among feasible solutions.
+
+    Returns True if a feasible partition was found and applied, False otherwise.
+    """
+    N = len(rateable)
+    if N == 0:
+        return True
+
+    costs = [1 if quota_mode == "judges" else j["rounds"] for j in rateable]
+    # Prefix sums for O(1) range-cost queries
+    prefix = [0] * (N + 1)
+    for i in range(N):
+        prefix[i + 1] = prefix[i] + costs[i]
+
+    tiers = [5, 4, 3, 2, 1]  # bottom-up order
+    t_min = [quotas.get(t, {}).get("min", 0) for t in tiers]
+    t_max = [quotas.get(t, {}).get("max", float("inf")) for t in tiers]
+
+    # Quick feasibility check
+    total_available = prefix[N]
+    total_min_needed = sum(t_min)
+    if total_available < total_min_needed:
+        return False  # mathematically impossible
+
+    # Suffix sums of tier minimums for look-ahead pruning
+    sfx_min = [0] * (len(tiers) + 1)
+    for i in range(len(tiers) - 1, -1, -1):
+        sfx_min[i] = sfx_min[i + 1] + t_min[i]
+
+    nat = [natural_tier(j["score"]) for j in rateable]
+    best = {"cuts": None, "dev": float("inf")}
+
+    def search(ti, start, cuts, dev_so_far):
+        # Prune: can't beat current best
+        if dev_so_far >= best["dev"]:
+            return
+
+        if ti == len(tiers) - 1:
+            # Last tier (tier 1) gets all remaining judges
+            k = N - start
+            s = prefix[N] - prefix[start]
+            if s < t_min[ti] or s > t_max[ti]:
+                return
+            d = dev_so_far + sum(abs(1 - nat[j]) for j in range(start, N))
+            if d < best["dev"]:
+                best["dev"] = d
+                best["cuts"] = cuts + (k,)
+            return
+
+        min_above = sfx_min[ti + 1]
+        cumcost = 0
+        tier_dev = 0
+        tier = tiers[ti]
+
+        for k in range(N - start + 1):
+            if k > 0:
+                cumcost += costs[start + k - 1]
+                tier_dev += abs(tier - nat[start + k - 1])
+            # Prune: exceeded tier max
+            if cumcost > t_max[ti]:
+                break
+            # Prune: not enough left for tiers above
+            remaining = prefix[N] - prefix[start + k]
+            if remaining < min_above:
+                break
+            # Only recurse when this tier's minimum is satisfied
+            if cumcost >= t_min[ti]:
+                search(ti + 1, start + k, cuts + (k,), dev_so_far + tier_dev)
+
+    search(0, 0, (), 0)
+
+    if best["cuts"] is None:
+        return False
+
+    # Apply the optimal partition
+    idx = 0
+    for ti, k in enumerate(best["cuts"]):
+        for _ in range(k):
+            rateable[idx]["tier"] = tiers[ti]
+            idx += 1
+    return True
+
+
+def _flexible_assign(rateable, quotas, quota_mode):
+    """Flexible assignment allowing any judge to go to any tier 1-5.
+
+    Uses iterative repair: starts at natural tiers, then moves judges
+    between tiers to fix deficits. Judges can be promoted or demoted
+    freely to satisfy quotas.
+
+    Returns True if all quotas were met, False otherwise.
+    """
+    cost_fn = (lambda j: 1) if quota_mode == "judges" else (lambda j: j["rounds"])
+
+    # Start at natural tier (clamped to 1-5)
+    for j in rateable:
+        nt = natural_tier(j["score"])
+        j["tier"] = max(1, min(5, nt))
+
+    max_iters = len(rateable) * 10
+
+    for _ in range(max_iters):
+        # Compute totals, deficits, surpluses
+        totals = {t: sum(cost_fn(j) for j in rateable if j["tier"] == t) for t in range(1, 6)}
+        deficits = {}
+        for t in range(1, 6):
+            q = quotas.get(t, {})
+            t_min, t_max = q.get("min", 0), q.get("max", float("inf"))
+            if totals[t] < t_min:
+                deficits[t] = t_min - totals[t]
+            elif totals[t] > t_max:
+                deficits[t] = -(totals[t] - t_max)  # negative = over-max
+
+        if not deficits:
+            return True  # All quotas met
+
+        # Pick most urgent deficit tier (largest under-min first, then over-max)
+        under = {t: d for t, d in deficits.items() if d > 0}
+        over = {t: -d for t, d in deficits.items() if d < 0}
+
+        if over:
+            # Fix over-max first: move worst judge from over tier to best available
+            target = max(over, key=over.get)
+            judges_in = sorted([j for j in rateable if j["tier"] == target],
+                               key=lambda j: -j["score"])
+            moved = False
+            for j in judges_in:
+                for dest in range(5, 0, -1):
+                    if dest == target:
+                        continue
+                    d_max = quotas.get(dest, {}).get("max", float("inf"))
+                    if totals[dest] + cost_fn(j) <= d_max:
+                        j["tier"] = dest
+                        moved = True
+                        break
+                if moved:
+                    break
+            if not moved:
+                return False
+            continue
+
+        # Fix under-min: move a judge TO the most deficit tier
+        target = max(under, key=under.get)
+
+        # Find best movable judge: from a tier with surplus above its own minimum
+        best_judge = None
+        best_priority = float("inf")
+        for src in range(1, 6):
+            if src == target:
+                continue
+            src_min = quotas.get(src, {}).get("min", 0)
+            for j in rateable:
+                if j["tier"] != src:
+                    continue
+                if totals[src] - cost_fn(j) < src_min:
+                    continue  # would break source
+                # Prefer judge whose natural tier is closest to target
+                p = abs(natural_tier(j["score"]) - target) * 10 + abs(src - target)
+                if p < best_priority:
+                    best_priority = p
+                    best_judge = j
+
+        if best_judge is None:
+            # All sources at minimum — force move from largest surplus tier
+            surplus_tiers = sorted(range(1, 6),
+                                   key=lambda t: totals[t] - quotas.get(t, {}).get("min", 0),
+                                   reverse=True)
+            for src in surplus_tiers:
+                if src == target:
+                    continue
+                candidates = [j for j in rateable if j["tier"] == src]
+                if candidates:
+                    candidates.sort(key=lambda j: abs(natural_tier(j["score"]) - target))
+                    best_judge = candidates[0]
+                    break
+
+        if best_judge is None:
+            return False  # truly stuck
+
+        best_judge["tier"] = target
+
+    return False  # didn't converge
+
+
+def _greedy_fallback(rateable, quotas, quota_mode):
+    """Best-effort greedy assignment when quotas are truly infeasible.
+
+    Fills tier minimums bottom-up, then assigns leftovers to tier 1.
+    """
+    cost_fn = (lambda j: 1) if quota_mode == "judges" else (lambda j: j["rounds"])
+
+    for j in rateable:
+        j["tier"] = None
+
+    for tier in range(5, 0, -1):
+        q_min = quotas.get(tier, {}).get("min", 0)
+        current = 0
+        for j in rateable:
+            if j["tier"] is not None:
+                continue
+            j["tier"] = tier
+            current += cost_fn(j)
+            if current >= q_min:
+                break
+
+    for j in rateable:
+        if j["tier"] is None:
+            j["tier"] = 1
+
+
 def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
-    """Assign tiers to judges satisfying quota constraints.
-    
+    """Assign tiers to judges guaranteeing quota constraints when feasible.
+
+    Strategy:
+      1. Optimal sequential partition (fast, preserves score ordering)
+      2. If that fails, try alternative sort order
+      3. If still fails, flexible assignment (any judge to any tier)
+      4. Only truly infeasible when strikes leave insufficient total rounds
+
     Args:
         judges_with_scores: list of dicts with keys:
-            name, school, rounds, score (absolute 1-6)
+            name, school, rounds, score (absolute 1-7)
         quotas: dict of tier -> {"min": int, "max": int}
-            e.g., {1: {"min": 10, "max": 20}, 2: {"min": 15, "max": 30}, ...}
         quota_mode: "rounds" (sum of available rounds) or "judges" (judge count)
-    
+
     Returns:
         list of dicts with added "tier" key, plus a report dict
     """
-    # Sort judges by score (best first)
-    sorted_judges = sorted(judges_with_scores, key=lambda j: (j["score"] or 99))
+    # Sort judges by score (worst first), ties broken by rounds desc for packing
+    sorted_judges = sorted(judges_with_scores,
+                           key=lambda j: (-(j["score"] or 99), -(j.get("rounds", 0))))
 
     # Phase 0: Apply tournament quality adjustment
     quality_adj = apply_quality_adjustment(sorted_judges)
 
-    # Phase 1: Assign natural tiers
-    for judge in sorted_judges:
-        judge["tier"] = natural_tier(judge["score"])
-        judge["is_boundary"] = False
-        # Flag boundary judges (score ends in .5)
-        if judge["score"] is not None and judge["score"] - int(judge["score"]) == 0.5:
-            judge["is_boundary"] = True
-
-    # Separate conflicts (tier 7) — they are excluded from quota logic
-    conflicts = [j for j in sorted_judges if j["tier"] == 7]
-    active_judges = [j for j in sorted_judges if j["tier"] != 7]
-
-    # Phase 2: Measure function based on quota mode
-    def tier_total(judges, tier):
-        if quota_mode == "judges":
-            return sum(1 for j in judges if j["tier"] == tier)
-        return sum(j["rounds"] for j in judges if j["tier"] == tier)
-
+    # Measure function
     def judge_cost(j):
-        """How much a single judge contributes to the tier total."""
         return 1 if quota_mode == "judges" else j["rounds"]
 
-    # Phase 3: Adjust to meet quotas
-    # Strategy: iterate tiers top-down for over-max (push down),
-    # then bottom-up for over-max on lower tiers (push up),
-    # then handle under-min by pulling from adjacent tiers
-    max_iterations = 100
-    for _ in range(max_iterations):
-        adjustments_made = False
+    # Phase 1: Separate conflicts (tier 7) and strikes (score 6.0)
+    conflicts = [j for j in sorted_judges if j["score"] is not None and j["score"] >= 7.0]
+    strikes = [j for j in sorted_judges if j["score"] is not None and 6.0 <= j["score"] < 7.0]
+    rateable = [j for j in sorted_judges
+                if j["score"] is not None and j["score"] < 6.0]
 
-        # Pass 1 (top-down): push overflow DOWN from tiers 1-5
-        for tier in range(1, 6):
-            if tier not in quotas:
-                continue
-            current = tier_total(active_judges, tier)
-            q = quotas[tier]
-            q_max = q.get("max", float("inf"))
+    for j in conflicts:
+        j["tier"] = 7
+    for j in strikes:
+        j["tier"] = 6
 
-            if current > q_max:
-                tier_judges = [j for j in active_judges if j["tier"] == tier]
-                tier_judges.sort(key=lambda j: -j["score"])
-                for j in tier_judges:
-                    if current <= q_max:
-                        break
-                    j["tier"] = tier + 1
-                    current -= judge_cost(j)
-                    adjustments_made = True
+    # Check if quotas are possible at all (only infeasible if strikes eat too many rounds)
+    total_rateable = sum(judge_cost(j) for j in rateable)
+    total_min_needed = sum(quotas.get(t, {}).get("min", 0) for t in range(1, 6))
+    truly_infeasible = total_rateable < total_min_needed
 
-        # Pass 2 (bottom-up): push overflow UP from strikes and tier 5
-        for tier in range(6, 0, -1):
-            if tier not in quotas:
-                continue
-            current = tier_total(active_judges, tier)
-            q = quotas[tier]
-            q_max = q.get("max", float("inf"))
+    feasible = False
+    if not truly_infeasible:
+        # Phase 2a: Try optimal sequential partition (high-round judges first for ties)
+        rateable.sort(key=lambda j: (-j["score"], -(j.get("rounds", 0))))
+        feasible = _find_optimal_partition(rateable, quotas, quota_mode)
 
-            if current > q_max:
-                # Move best judges in this tier UP to the tier above
-                # Prefer promoting judges with better scores; keep score>=5 low
-                tier_judges = [j for j in active_judges if j["tier"] == tier]
-                tier_judges.sort(key=lambda j: (1 if j["score"] >= 5.0 else 0, j["score"]))
-                target = tier - 1
-                # Find the nearest tier above that can accept judges
-                while target >= 1:
-                    target_current = tier_total(active_judges, target)
-                    target_max = quotas.get(target, {}).get("max", float("inf"))
-                    if target_current < target_max:
-                        break
-                    target -= 1
-                if target < 1:
-                    target = tier - 1  # fallback: push up anyway
+        if not feasible:
+            # Phase 2b: Try alternative sort (low-round judges first for ties)
+            rateable.sort(key=lambda j: (-j["score"], j.get("rounds", 0)))
+            feasible = _find_optimal_partition(rateable, quotas, quota_mode)
 
-                for j in tier_judges:
-                    if current <= q_max:
-                        break
-                    # Strikes only move up to tier 5 (conservative)
-                    if tier == 6:
-                        j["tier"] = max(target, 5)
-                    else:
-                        j["tier"] = target
-                    current -= judge_cost(j)
-                    adjustments_made = True
+        if not feasible:
+            # Phase 3: Flexible assignment — any judge can go to any tier
+            rateable.sort(key=lambda j: (-j["score"], -(j.get("rounds", 0))))
+            feasible = _flexible_assign(rateable, quotas, quota_mode)
 
-        # Pass 3: handle under-min by pulling from tier below
-        # Deprioritize score>=5.0 judges — only pull them as last resort
-        for tier in range(1, 7):
-            if tier not in quotas:
-                continue
-            current = tier_total(active_judges, tier)
-            q = quotas[tier]
-            q_min = q.get("min", 0)
+    if not feasible:
+        # Truly infeasible (strikes consumed too many rounds) — best effort
+        rateable.sort(key=lambda j: (-j["score"], -(j.get("rounds", 0))))
+        _greedy_fallback(rateable, quotas, quota_mode)
 
-            if current < q_min:
-                next_tier = tier + 1
-                next_judges = [j for j in active_judges if j["tier"] == next_tier]
-                next_judges.sort(key=lambda j: (1 if j["score"] >= 5.0 else 0, j["score"]))
-                for j in next_judges:
-                    if current >= q_min:
-                        break
-                    if j["tier"] == 6 and tier < 5:
-                        continue
-                    j["tier"] = tier
-                    current += judge_cost(j)
-                    adjustments_made = True
-
-        if not adjustments_made:
-            break
-
-    # Pass 4: Post-stabilization swap — push score>=5 judges back to tier 5
-    # If a score>=5 judge got promoted above tier 5, try to swap with a
-    # better-scored judge in tier 5 (keeps quotas intact via 1-for-1 swap)
-    promoted_bad = [j for j in active_judges if j["score"] >= 5.0 and j["tier"] < 5]
-    promoted_bad.sort(key=lambda j: -j["score"])  # worst first
-    for bad in promoted_bad:
-        bad_tier = bad["tier"]
-        # Find a swap candidate in tier 5 with a better score
-        candidates = [j for j in active_judges
-                      if j["tier"] == 5 and j["score"] < 5.0]
-        candidates.sort(key=lambda j: j["score"])  # best first
-        for good in candidates:
-            # Swap: move good judge up, bad judge down to 5
-            good["tier"] = bad_tier
-            bad["tier"] = 5
-            # Verify quotas still hold after swap
-            ok = True
-            for t in [bad_tier, 5]:
-                q = quotas.get(t, {})
-                total = tier_total(active_judges, t)
-                if "min" in q and total < q["min"]:
-                    ok = False
-                if "max" in q and total > q["max"]:
-                    ok = False
-            if ok:
-                break  # swap succeeded
-            else:
-                # Revert swap
-                bad["tier"] = bad_tier
-                good["tier"] = 5
+    active_judges = rateable + strikes
 
     # Build report
-    report = {"quota_mode": quota_mode, "quality_adjustment": quality_adj}
+    report = {
+        "quota_mode": quota_mode,
+        "quality_adjustment": quality_adj,
+        "feasible": feasible,
+    }
     for tier in range(1, 7):
-        total = tier_total(active_judges, tier)
+        total = sum(judge_cost(j) for j in active_judges if j["tier"] == tier)
         count = sum(1 for j in active_judges if j["tier"] == tier)
         rounds = sum(j["rounds"] for j in active_judges if j["tier"] == tier)
         q = quotas.get(tier, {})
@@ -247,7 +377,6 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
             "quota_max": q.get("max", "-"),
             "met": met,
         }
-    # Conflict tier (no quotas)
     report[7] = {
         "judges": len(conflicts),
         "total_rounds": sum(j["rounds"] for j in conflicts),
@@ -269,6 +398,8 @@ def format_report(report):
     if adj != 0:
         direction = "stronger pool → scores shifted up" if adj > 0 else "weaker pool → scores improved"
         lines.append(f"Tournament quality adjustment: {adj:+.1f} ({direction})")
+    if not report.get("feasible", True):
+        lines.append("⚠️  Quotas infeasible — best-effort assignment used")
     lines.append(f"Quota mode: {mode_label}")
     lines.append(f"{'Tier':<6} {'Judges':<8} {'Rounds':<8} {mode_label + ' (quota)':<16} {'Min':<6} {'Max':<6} {'Status'}")
     lines.append("-" * 60)

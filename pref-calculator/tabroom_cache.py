@@ -58,3 +58,6 @@ class TabroomCache:
 
     def __len__(self):
         return len(self._cache)
+
+    def __bool__(self):
+        return True

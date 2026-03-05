@@ -145,10 +145,9 @@ class TabroomScraper:
         return result
 
     def fetch_paradigm_by_name(self, name: str) -> dict | None:
-        """Search for a judge by name and fetch their paradigm.
+        """Fetch paradigm by hitting the search URL directly.
 
         Accepts names in "Last, First" or "First Last" format.
-        Returns the best match paradigm dict or None.
         """
         if ", " in name:
             last, first = name.split(", ", 1)
@@ -157,41 +156,18 @@ class TabroomScraper:
             first = parts[0] if parts else ""
             last = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-        results = self.search_judges(first.strip(), last.strip())
-        if not results:
+        url = f"{PARADIGM_SEARCH}?search_first={first.strip()}&search_last={last.strip()}"
+        try:
+            resp = self._client.get(url)
+        except httpx.HTTPError as e:
+            print(f"[TabroomScraper] Fetch error for {name}: {e}")
             return None
 
-        # If we got a direct paradigm (single result), return it
-        if len(results) == 1:
-            r = results[0]
-            if r.get("philosophy"):
-                return r
-            # Need to fetch full paradigm
-            if r.get("judge_person_id"):
-                return self.fetch_paradigm(r["judge_person_id"])
-            return r
-
-        # Multiple results: try to find best name match
-        target = f"{first} {last}".lower().strip()
-        best = None
-        best_score = 0
-        for r in results:
-            rname = r.get("name", "").lower()
-            # Simple substring matching
-            score = 0
-            if target in rname or rname in target:
-                score = 100
-            elif last.lower() in rname and first.lower() in rname:
-                score = 90
-            elif last.lower() in rname:
-                score = 50
-            if score > best_score:
-                best_score = score
-                best = r
-
-        if best and best.get("judge_person_id"):
-            return self.fetch_paradigm(best["judge_person_id"])
-        return best
+        soup = BeautifulSoup(resp.text, "html.parser")
+        result = self._parse_paradigm_page(soup)
+        if result:
+            result["paradigm_url"] = str(resp.url)
+        return result
 
     def _parse_paradigm_page(self, soup: BeautifulSoup) -> dict | None:
         """Extract paradigm data from a parsed paradigm page."""
