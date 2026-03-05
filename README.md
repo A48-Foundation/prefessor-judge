@@ -34,16 +34,20 @@ The pairwise ranker uses an **Elo rating system** (the same model used in chess 
 #### Adaptive Swiss Pairing
 A full round-robin of 85 judges would require **3,570** comparisons. Instead, the system uses Swiss-style pairing across **6 rounds**:
 
-1. **Rounds 1–2 (Calibration):** Each unknown judge is paired against an **anchor judge** with a known Notion score. This calibrates the Elo scale — a judge who beats a known "2" gets pulled toward that rating.
-2. **Rounds 3–6 (Adaptive):** Judges are sorted by current Elo and paired against their **closest-rated opponent**. This sharpens the tier boundaries where it matters most — you compare judges that are close in quality, not ones that are obviously different.
+1. **Anchor Calibration (every round):** Each unknown judge is paired against the **closest-Elo anchor** — a judge with a known score from Notion or one directly rated during the session. As you rate more judges, the anchor pool grows and calibration improves.
+2. **Adaptive Peer Pairing:** Remaining unknowns are sorted by current Elo and paired against their **closest-rated opponent**. This sharpens the tier boundaries where it matters most — you compare judges that are close in quality, not ones that are obviously different.
 
 Each round generates ~N/2 comparisons (one per judge pair), so 6 rounds × ~42 pairs = **~250 comparisons** for 85 judges — far fewer than 3,570.
 
 #### Hybrid Mode
-During pairwise comparison, you can **directly rate** either judge at any time using the dropdown selects (1–5, Strike, Conflict). This removes the judge from all future comparisons and sets their Elo to match the chosen score. Use this for:
-- **Obvious strikes** — don't waste comparisons on judges you already know you want to strike.
-- **Clear favorites** — if you immediately know a judge is a "1", rate them directly.
-- **The uncertain middle** — let pairwise comparisons handle the judges you're unsure about.
+During pairwise comparison, you can **directly rate** either judge at any time using the dropdown selects (1–5, Strike, Conflict). This removes the judge from all future comparisons and sets their Elo to match the chosen score.
+
+**Rated judges become anchors** — once you directly rate a judge, they join the anchor pool. In future rounds, remaining unknown judges are paired against the closest-Elo anchor for calibration. This means the more judges you rate directly, the more accurate the pairwise comparisons become for the remaining judges.
+
+Use direct rating for:
+- **Obvious strikes** — don't waste comparisons on judges you already know you want to strike
+- **Clear favorites** — if you immediately know a judge is a "1", rate them directly
+- **The uncertain middle** — let pairwise comparisons handle the judges you're unsure about
 
 #### Score Derivation
 After all comparisons, judges are sorted by final Elo and **linearly spread** across the 1.0–5.0 score range:
