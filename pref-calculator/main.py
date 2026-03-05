@@ -485,10 +485,10 @@ class RateSelect(ui.Select):
             await _finish_comparison(interaction.channel, session)
         else:
             info_embeds, para_embeds = _build_comparison_embeds(session)
-            await _update_paradigms(interaction.channel, session, para_embeds)
             await interaction.response.edit_message(
                 content=f"✅ **{judge['name']}** rated **{label}**.",
                 embeds=info_embeds, view=self.view)
+            await _update_paradigms(interaction.channel, session, para_embeds)
 
 
 class PairwiseView(ui.View):
@@ -522,8 +522,8 @@ class PairwiseView(ui.View):
             session.scores_map.pop(judge_name, None)
         if session.ranker.undo():
             info_embeds, para_embeds = _build_comparison_embeds(session)
-            await _update_paradigms(interaction.channel, session, para_embeds)
             await interaction.response.edit_message(content="↩️ Undone.", embeds=info_embeds, view=self)
+            await _update_paradigms(interaction.channel, session, para_embeds)
         else:
             await interaction.response.edit_message(content="Nothing to undo.")
 
@@ -570,10 +570,10 @@ class PairwiseView(ui.View):
             await _finish_comparison(interaction.channel, session)
         else:
             info_embeds, para_embeds = _build_comparison_embeds(session)
-            await _update_paradigms(interaction.channel, session, para_embeds)
             await interaction.response.edit_message(
                 content=f"✅ **{judge['name']}** marked as **{label}**.",
                 embeds=info_embeds, view=self)
+            await _update_paradigms(interaction.channel, session, para_embeds)
 
     async def _record(self, interaction: discord.Interaction, choice: str):
         session = self.session
@@ -598,8 +598,8 @@ class PairwiseView(ui.View):
             await _finish_comparison(interaction.channel, session)
         else:
             info_embeds, para_embeds = _build_comparison_embeds(session)
-            await _update_paradigms(interaction.channel, session, para_embeds)
             await interaction.response.edit_message(content=None, embeds=info_embeds, view=self)
+            await _update_paradigms(interaction.channel, session, para_embeds)
 
 
 def _build_comparison_embeds(session: PrefSession) -> tuple[list[discord.Embed], list[discord.Embed]]:
