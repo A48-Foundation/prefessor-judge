@@ -226,7 +226,7 @@ class ScoreButton(ui.Button):
 
 class ScoringView(ui.View):
     def __init__(self, session: PrefSession):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.session = session
         styles = {1: discord.ButtonStyle.success, 2: discord.ButtonStyle.success,
                   3: discord.ButtonStyle.primary, 4: discord.ButtonStyle.primary,
@@ -303,7 +303,7 @@ class ScoringView(ui.View):
 class CompareSelectView(ui.View):
     def __init__(self, session: PrefSession, current_judge: dict,
                  options: list[discord.SelectOption], parent_view: ScoringView):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
         self.session = session
         self.current_judge = current_judge
         self.parent_view = parent_view
@@ -346,7 +346,7 @@ class CompareSelectView(ui.View):
 
 class BackToScoringView(ui.View):
     def __init__(self, parent_view: ScoringView):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
         self.parent_view = parent_view
 
     @ui.button(label="◀ Back to Scoring", style=discord.ButtonStyle.primary)
@@ -415,7 +415,7 @@ class ReScoreModal(ui.Modal, title="Re-score Judge"):
 
 class ReviewView(ui.View):
     def __init__(self, session: PrefSession):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.session = session
         session._review_view = self
         if session.unmatched:
@@ -493,9 +493,8 @@ class RateSelect(ui.Select):
 
 class PairwiseView(ui.View):
     def __init__(self, session: PrefSession):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.session = session
-        # Add rating dropdowns for direct scoring
         self.add_item(RateSelect("a", session))
         self.add_item(RateSelect("b", session))
 
@@ -731,7 +730,7 @@ def _build_paradigm_embed(judge: dict, session: PrefSession, color: int = EMBED_
 
 class QuotaModeView(ui.View):
     def __init__(self, session: PrefSession):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.session = session
 
     @ui.button(label="1️⃣ Round Count", style=discord.ButtonStyle.primary)
@@ -840,6 +839,32 @@ async def on_message(message: discord.Message):
         del sessions[channel_id]
         await message.channel.send(embed=discord.Embed(
             title="❌ Cancelled", description="Prefs workflow cancelled.", color=ERROR_COLOR))
+        return
+
+    if clean == "resume" or raw == "resume":
+        if session.state == "comparing" and session.ranker and not session.ranker.is_complete:
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            view = PairwiseView(session)
+            await _update_paradigms(message.channel, session, para_embeds)
+            await message.channel.send(
+                content=f"▶️ Resuming — {session.ranker.remaining} comparisons left.",
+                embeds=info_embeds, view=view)
+        elif session.state == "prompting_scores":
+            judge = session.unmatched[session.current_idx]
+            total = len(session.unmatched)
+            idx = session.current_idx + 1
+            embed = discord.Embed(title=f"Judge {idx}/{total} — {judge['name']}", color=EMBED_COLOR)
+            embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
+            embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
+            embed.set_footer(text=f"Progress: {idx}/{total}")
+            view = ScoringView(session)
+            await message.channel.send(content="▶️ Resuming scoring…", embed=embed, view=view)
+            para_embed = _build_paradigm_embed(judge, session)
+            await _update_paradigms(message.channel, session, [para_embed])
+        else:
+            await message.channel.send(embed=discord.Embed(
+                description=f"Current state: **{session.state}** — nothing to resume. Send your input to continue.",
+                color=WARN_COLOR))
         return
 
     try:
