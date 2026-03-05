@@ -1,1 +1,1 @@
-worker: cd pref-calculator && python bot.py
+worker: cd pref-calculator && python main.py
