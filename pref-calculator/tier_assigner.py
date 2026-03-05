@@ -4,6 +4,46 @@ Maps absolute scores to tiers and adjusts to satisfy round quotas.
 """
 import math
 
+TOURNAMENT_QUALITY_BASELINE = 3.5
+TOURNAMENT_QUALITY_FACTOR_STRONG = 0.25  # gentle when pool is strong (scores shift up)
+TOURNAMENT_QUALITY_FACTOR_WEAK = 0.75    # moderate when pool is weak (scores improve)
+
+
+def tournament_quality_adjustment(judges_with_scores):
+    """Calculate tournament pool quality adjustment.
+    
+    Computes the average score of rated judges (excluding strikes/conflicts)
+    and returns an adjustment value. Strong pool (low avg) → positive adjustment
+    (shifts scores up/worse). Weak pool (high avg) → negative adjustment
+    (shifts scores down/better).
+    """
+    rated = [j["score"] for j in judges_with_scores
+             if j["score"] is not None and j["score"] < 6.0]
+    if not rated:
+        return 0.0
+    pool_avg = sum(rated) / len(rated)
+    diff = TOURNAMENT_QUALITY_BASELINE - pool_avg
+    # Asymmetric: gentle for strong pools (diff > 0), moderate for weak pools (diff < 0)
+    factor = TOURNAMENT_QUALITY_FACTOR_STRONG if diff > 0 else TOURNAMENT_QUALITY_FACTOR_WEAK
+    adjustment = diff * factor
+    return round(adjustment * 2) / 2  # snap to 0.5
+
+
+def apply_quality_adjustment(judges_with_scores):
+    """Apply tournament quality adjustment to judge scores.
+    
+    Returns the adjustment value applied. Strikes (6) and conflicts (7) are not adjusted.
+    Adjusted scores are clamped to [1.0, 5.5].
+    """
+    adj = tournament_quality_adjustment(judges_with_scores)
+    if adj == 0:
+        return adj
+    for judge in judges_with_scores:
+        if judge["score"] is None or judge["score"] >= 6.0:
+            continue  # don't adjust strikes/conflicts
+        judge["score"] = max(1.0, min(5.5, round((judge["score"] + adj) * 2) / 2))
+    return adj
+
 
 def natural_tier(score):
     """Map an absolute score (1-7) to its natural tier (1-7).
@@ -44,6 +84,9 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
     """
     # Sort judges by score (best first)
     sorted_judges = sorted(judges_with_scores, key=lambda j: (j["score"] or 99))
+
+    # Phase 0: Apply tournament quality adjustment
+    quality_adj = apply_quality_adjustment(sorted_judges)
 
     # Phase 1: Assign natural tiers
     for judge in sorted_judges:
@@ -185,7 +228,7 @@ def assign_tiers(judges_with_scores, quotas, quota_mode="rounds"):
                 good["tier"] = 5
 
     # Build report
-    report = {"quota_mode": quota_mode}
+    report = {"quota_mode": quota_mode, "quality_adjustment": quality_adj}
     for tier in range(1, 7):
         total = tier_total(active_judges, tier)
         count = sum(1 for j in active_judges if j["tier"] == tier)
@@ -222,6 +265,10 @@ def format_report(report):
     mode = report.get("quota_mode", "rounds")
     mode_label = "Judges" if mode == "judges" else "Rounds"
     lines = []
+    adj = report.get("quality_adjustment", 0)
+    if adj != 0:
+        direction = "stronger pool → scores shifted up" if adj > 0 else "weaker pool → scores improved"
+        lines.append(f"Tournament quality adjustment: {adj:+.1f} ({direction})")
     lines.append(f"Quota mode: {mode_label}")
     lines.append(f"{'Tier':<6} {'Judges':<8} {'Rounds':<8} {mode_label + ' (quota)':<16} {'Min':<6} {'Max':<6} {'Status'}")
     lines.append("-" * 60)
