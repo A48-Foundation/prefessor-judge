@@ -62,53 +62,56 @@ class PairwiseRanker:
         self._current_round += 1
 
         n = len(self.unknown)
-        if n < 2:
+        if n < 2 and not self.anchors:
             return
 
         new_pairs = []
 
-        # Round 1-2: anchor calibration + random peer pairing
-        if self._current_round <= 2 and self.anchors:
+        # Anchor calibration: pair unknowns against anchors (original + directly rated)
+        if self.anchors:
             for uj in self.unknown:
                 available = [a for a in self.anchors
                              if self._pair_key(uj["name"], a["name"]) not in self._matched_pairs]
                 if available:
-                    aj = random.choice(available)
+                    # Pick anchor closest in Elo for sharper calibration
+                    uj_elo = self.elo.get(uj["name"], DEFAULT_ELO)
+                    available.sort(key=lambda a: abs(self.elo.get(a["name"], DEFAULT_ELO) - uj_elo))
+                    aj = available[0]
                     pk = self._pair_key(uj["name"], aj["name"])
                     self._matched_pairs.add(pk)
                     new_pairs.append((uj, aj))
 
         # Adaptive peer pairing: sort by Elo, pair adjacent judges
-        sorted_judges = sorted(self.unknown, key=lambda j: -self.elo.get(j["name"], DEFAULT_ELO))
-        # Slight randomization within similar Elo to avoid deterministic loops
-        for i in range(len(sorted_judges) - 1):
-            if abs(self.elo.get(sorted_judges[i]["name"], 0) - self.elo.get(sorted_judges[i+1]["name"], 0)) < 5:
-                if random.random() < 0.5:
-                    sorted_judges[i], sorted_judges[i+1] = sorted_judges[i+1], sorted_judges[i]
+        if n >= 2:
+            sorted_judges = sorted(self.unknown, key=lambda j: -self.elo.get(j["name"], DEFAULT_ELO))
+            # Slight randomization within similar Elo to avoid deterministic loops
+            for i in range(len(sorted_judges) - 1):
+                if abs(self.elo.get(sorted_judges[i]["name"], 0) - self.elo.get(sorted_judges[i+1]["name"], 0)) < 5:
+                    if random.random() < 0.5:
+                        sorted_judges[i], sorted_judges[i+1] = sorted_judges[i+1], sorted_judges[i]
 
-        paired_this_round = set()
-        for j in sorted_judges:
-            if j["name"] in paired_this_round:
-                continue
-            # Find closest Elo opponent not yet paired this round and not a repeat
-            best = None
-            best_diff = float("inf")
-            for k in sorted_judges:
-                if k["name"] == j["name"] or k["name"] in paired_this_round:
+            paired_this_round = set()
+            for j in sorted_judges:
+                if j["name"] in paired_this_round:
                     continue
-                pk = self._pair_key(j["name"], k["name"])
-                if pk in self._matched_pairs:
-                    continue
-                diff = abs(self.elo.get(j["name"], DEFAULT_ELO) - self.elo.get(k["name"], DEFAULT_ELO))
-                if diff < best_diff:
-                    best_diff = diff
-                    best = k
-            if best:
-                pk = self._pair_key(j["name"], best["name"])
-                self._matched_pairs.add(pk)
-                paired_this_round.add(j["name"])
-                paired_this_round.add(best["name"])
-                new_pairs.append((j, best))
+                best = None
+                best_diff = float("inf")
+                for k in sorted_judges:
+                    if k["name"] == j["name"] or k["name"] in paired_this_round:
+                        continue
+                    pk = self._pair_key(j["name"], k["name"])
+                    if pk in self._matched_pairs:
+                        continue
+                    diff = abs(self.elo.get(j["name"], DEFAULT_ELO) - self.elo.get(k["name"], DEFAULT_ELO))
+                    if diff < best_diff:
+                        best_diff = diff
+                        best = k
+                if best:
+                    pk = self._pair_key(j["name"], best["name"])
+                    self._matched_pairs.add(pk)
+                    paired_this_round.add(j["name"])
+                    paired_this_round.add(best["name"])
+                    new_pairs.append((j, best))
 
         random.shuffle(new_pairs)
         self._pair_queue.extend(new_pairs)
@@ -184,6 +187,8 @@ class PairwiseRanker:
             judge = action["judge"]
             self.elo[judge["name"]] = action["elo_before"]
             self.unknown.append(judge)
+            # Remove from anchors (was promoted on rate)
+            self.anchors = [a for a in self.anchors if a["name"] != judge["name"]]
             for pair in reversed(action["removed_pairs"]):
                 self._pair_queue.insert(0, pair)
         return True
@@ -209,7 +214,7 @@ class PairwiseRanker:
             self._build_next_round()
 
     def rate_judge(self, judge, score):
-        """Directly rate a judge (1-5), setting their Elo and removing from comparisons."""
+        """Directly rate a judge (1-5), setting their Elo and promoting to anchor."""
         removed_pairs = [
             (a, b) for a, b in self._pair_queue
             if a["name"] == judge["name"] or b["name"] == judge["name"]
@@ -227,6 +232,10 @@ class PairwiseRanker:
             if a["name"] != judge["name"] and b["name"] != judge["name"]
         ]
         self.unknown = [j for j in self.unknown if j["name"] != judge["name"]]
+        # Promote to anchor so future rounds use this judge for calibration
+        rated = dict(judge)
+        rated["score"] = score
+        self.anchors.append(rated)
         if not self._pair_queue and self._current_round < self._rounds_total:
             self._build_next_round()
 
