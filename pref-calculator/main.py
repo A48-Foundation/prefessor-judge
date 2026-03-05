@@ -444,10 +444,60 @@ class ReviewView(ui.View):
 # Pairwise Comparison Views
 # ---------------------------------------------------------------------------
 
+class RateSelect(ui.Select):
+    """Dropdown to directly rate Judge A or B (1-5, Strike, Conflict)."""
+    def __init__(self, which: str, session: PrefSession):
+        self.which = which  # "a" or "b"
+        self.session = session
+        label = "Rate A directly" if which == "a" else "Rate B directly"
+        options = [
+            discord.SelectOption(label="1 (Best)", value="1"),
+            discord.SelectOption(label="2", value="2"),
+            discord.SelectOption(label="3", value="3"),
+            discord.SelectOption(label="4", value="4"),
+            discord.SelectOption(label="5 (Worst)", value="5"),
+            discord.SelectOption(label="Strike", value="6"),
+            discord.SelectOption(label="Conflict", value="7"),
+        ]
+        row = 2 if which == "a" else 3
+        super().__init__(placeholder=label, options=options, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        session = self.session
+        if not session.ranker:
+            return
+        pair = session.ranker.next_pair()
+        if not pair:
+            return
+        judge = pair[0] if self.which == "a" else pair[1]
+        score = float(self.values[0])
+        label = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "Strike", 7: "Conflict"}.get(int(score), str(score))
+        session.scores_map[judge["name"]] = score
+
+        if score in (6.0, 7.0):
+            session.ranker.remove_judge(judge, score)
+        else:
+            session.ranker.rate_judge(judge, score)
+
+        if session.ranker.is_complete:
+            self.view.stop()
+            await interaction.response.edit_message(content="⏳ Finishing comparison…", embeds=[], view=None)
+            await _finish_comparison(interaction.channel, session)
+        else:
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            await _update_paradigms(interaction.channel, session, para_embeds)
+            await interaction.response.edit_message(
+                content=f"✅ **{judge['name']}** rated **{label}**.",
+                embeds=info_embeds, view=self.view)
+
+
 class PairwiseView(ui.View):
     def __init__(self, session: PrefSession):
         super().__init__(timeout=600)
         self.session = session
+        # Add rating dropdowns for direct scoring
+        self.add_item(RateSelect("a", session))
+        self.add_item(RateSelect("b", session))
 
     @ui.button(label="A", style=discord.ButtonStyle.primary, row=0)
     async def pick_a(self, interaction: discord.Interaction, button: ui.Button):
@@ -613,6 +663,8 @@ def _build_comparison_embeds(session: PrefSession) -> tuple[list[discord.Embed],
     strike_rounds = sum(all_session_judges.get(n, {}).get("rounds", 0) for n in strike_names)
     conflict_rounds = sum(all_session_judges.get(n, {}).get("rounds", 0) for n in conflict_names)
     footer_parts = [f"Matchup {done + 1}/{total}"]
+    if hasattr(session.ranker, '_current_round'):
+        footer_parts.append(f"Swiss round {session.ranker._current_round}/{session.ranker._rounds_total}")
     if strike_names:
         footer_parts.append(f"🚫 {len(strike_names)} strike{'s' if len(strike_names) != 1 else ''} ({strike_rounds} rds)")
     if conflict_names:
