@@ -1082,7 +1082,6 @@ async def _finish_comparison(channel, session: PrefSession):
     for judge, score in scores:
         session.scores_map[judge["name"]] = score
 
-    embed = discord.Embed(title="📊 Comparison Results", color=SUCCESS_COLOR)
     lines = []
     score_map = {j["name"]: s for j, s in scores}
     for rank, (judge, elo) in enumerate(rankings, 1):
@@ -1092,6 +1091,20 @@ async def _finish_comparison(channel, session: PrefSession):
         else:
             label = str(score_map.get(judge["name"], "?"))
         lines.append(f"`#{rank}` **{judge['name']}** — Score: **{label}** (Elo: {elo:.0f})")
+
+    # Append struck/conflicted judges that were removed during comparison
+    all_ranked_names = {j["name"] for j, _ in rankings}
+    special_lines = []
+    for name, sc in session.scores_map.items():
+        if name not in all_ranked_names and sc in (6.0, 7.0):
+            label = "Strike" if sc == 6.0 else "Conflict"
+            special_lines.append(f"🚫 **{name}** — **{label}**")
+    if special_lines:
+        lines.append("")
+        lines.extend(special_lines)
+
+    total = len(rankings) + len(special_lines)
+    embed = discord.Embed(title=f"📊 Comparison Results ({total} judges: {len(rankings)} ranked, {len(special_lines)} struck/conflicted)", color=SUCCESS_COLOR)
 
     # Split across multiple fields to avoid 1024-char limit
     chunk = []
