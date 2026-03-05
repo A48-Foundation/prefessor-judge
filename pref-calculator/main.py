@@ -449,18 +449,18 @@ class RateSelect(ui.Select):
     def __init__(self, which: str, session: PrefSession):
         self.which = which  # "a" or "b"
         self.session = session
-        label = "Rate A directly" if which == "a" else "Rate B directly"
+        side = "🅰️ Judge A" if which == "a" else "🅱️ Judge B"
         options = [
-            discord.SelectOption(label="1 (Best)", value="1"),
-            discord.SelectOption(label="2", value="2"),
-            discord.SelectOption(label="3", value="3"),
-            discord.SelectOption(label="4", value="4"),
-            discord.SelectOption(label="5 (Worst)", value="5"),
-            discord.SelectOption(label="Strike", value="6"),
-            discord.SelectOption(label="Conflict", value="7"),
+            discord.SelectOption(label="1 — Best", value="1", emoji="⭐"),
+            discord.SelectOption(label="2 — Good", value="2", emoji="👍"),
+            discord.SelectOption(label="3 — Average", value="3", emoji="➖"),
+            discord.SelectOption(label="4 — Below Average", value="4", emoji="👎"),
+            discord.SelectOption(label="5 — Worst", value="5", emoji="⛔"),
+            discord.SelectOption(label="Strike", value="6", emoji="🚫"),
+            discord.SelectOption(label="Conflict", value="7", emoji="⚠️"),
         ]
         row = 2 if which == "a" else 3
-        super().__init__(placeholder=label, options=options, row=row)
+        super().__init__(placeholder=f"Rate {side} directly…", options=options, row=row, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         session = self.session
