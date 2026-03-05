@@ -144,20 +144,18 @@ The tier assignment algorithm is designed to maximize the probability of getting
 prefessor-judge/
 ├── pref-calculator/
 │   ├── main.py                 # Discord bot (entry point)
-│   ├── cli.py                  # CLI version (standalone)
 │   ├── csv_parser.py           # Parse tournament judge CSV files
 │   ├── csv_writer.py           # Write output CSV with tier assignments
 │   ├── name_matcher.py         # Fuzzy match CSV names to Notion database
 │   ├── notion_reader.py        # Fetch absolute scores from Notion
 │   ├── pairwise_ranker.py      # Elo + adaptive Swiss pairwise ranking
-│   ├── score_prompter.py       # CLI score prompting for unknown judges
 │   ├── tier_assigner.py        # Core tier assignment algorithm
 │   ├── tabroom_scraper.py      # Tabroom.com paradigm scraper
 │   ├── tabroom_cache.py        # In-memory cache for paradigm data
-│   ├── requirements.txt        # Python dependencies
-│   └── generate_test_data.py   # Test data generator
+│   └── requirements.txt        # Python dependencies
 ├── Procfile                    # Railway deployment
 ├── railway.toml                # Railway config
+├── requirements.txt            # Root requirements (references pref-calculator)
 ├── run_bot.ps1                 # PowerShell launcher for the bot
 └── .gitignore
 ```
