@@ -131,6 +131,15 @@ def parse_all_quotas(text: str, mode: str) -> dict[int, dict] | None:
     return quotas if quotas else None
 
 
+def _score_label(score: float) -> str:
+    """Return display label for an internal score: 'C' for conflict, 'S' for strike, else the number."""
+    if score >= 7.0:
+        return "C"
+    if score >= 6.0:
+        return "S"
+    return str(score)
+
+
 def build_judge_embed(judge: dict, paradigm: dict | None, *, score: float | None = None,
                       index: int | None = None, total: int | None = None) -> discord.Embed:
     title = judge["name"]
@@ -140,7 +149,7 @@ def build_judge_embed(judge: dict, paradigm: dict | None, *, score: float | None
     embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
     embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
     if score is not None:
-        label = "Strike" if int(score) >= 6 else str(score)
+        label = _score_label(score)
         embed.add_field(name="⭐ Score", value=label, inline=True)
     url = tabroom_paradigm_url(judge["name"])
     if paradigm and paradigm.get("philosophy"):
@@ -164,9 +173,12 @@ def split_name(name: str) -> tuple[str, str]:
 def _normalize_score(raw: float, rating_max: int) -> float:
     """Normalize a raw score from [1, rating_max] to internal [1.0, 5.0].
 
+    Values >= rating_max + 2 map to 7.0 (conflict).
     Values >= rating_max + 1 map to 6.0 (strike).
     For rating_max == 5 this is an identity.
     """
+    if raw >= rating_max + 2:
+        return 7.0
     if raw >= rating_max + 1:
         return 6.0
     if rating_max == 5:
@@ -179,12 +191,15 @@ def _parse_prefilled_rating(rating_str: str, rating_max: int = 5) -> float | Non
 
     Values 1..rating_max are normalized to the internal 1-5 scale.
     rating_max+1 and 'S' map to 6.0 (strike).
+    'C' maps to 7.0 (conflict).
     """
     s = rating_str.strip().upper()
     if not s:
         return None
     if s == "S":
         return 6.0
+    if s == "C":
+        return 7.0
     try:
         val = float(s)
         if val < 1:
@@ -362,7 +377,7 @@ class ScoringView(ui.View):
         embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
         embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
         if existing_score is not None:
-            label = "Strike" if int(existing_score) >= 6 else str(existing_score)
+            label = _score_label(existing_score)
             embed.add_field(name="⭐ Score", value=label, inline=True)
         url = tabroom_paradigm_url(judge["name"])
         embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
@@ -475,7 +490,7 @@ class ReviewEditSelect(ui.Select):
 
 
 class ReScoreModal(ui.Modal, title="Re-score Judge"):
-    score_input = ui.TextInput(label="Score", placeholder="e.g. 3 or 3.5, or S for strike",
+    score_input = ui.TextInput(label="Score", placeholder="e.g. 3, S for strike, C for conflict",
                                max_length=4, required=True)
 
     def __init__(self, session: PrefSession, judge: dict):
@@ -485,13 +500,15 @@ class ReScoreModal(ui.Modal, title="Re-score Judge"):
         current = session.scores_map.get(judge["name"], 4.0)
         self.score_input.default = str(current)
         rm = session.rating_max
-        self.score_input.label = f"Score (1-{rm}, or {rm + 1}/S for strike)"
+        self.score_input.label = f"Score (1-{rm}, S=strike, C=conflict)"
 
     async def on_submit(self, interaction: discord.Interaction):
         rm = self.session.rating_max
         raw_text = self.score_input.value.strip().upper()
         if raw_text == "S":
             score = 6.0
+        elif raw_text == "C":
+            score = 7.0
         else:
             try:
                 raw = float(raw_text)
@@ -524,7 +541,7 @@ class ReviewView(ui.View):
         lines = []
         for j in self.session.unmatched:
             score = self.session.scores_map.get(j["name"], 4.0)
-            label = "Strike" if score >= 6.0 else str(score)
+            label = _score_label(score)
             lines.append(f"• **{j['name']}** ({j['school']}) — {label}")
         embed.add_field(name="Scored Judges", value="\n".join(lines) or "None", inline=False)
         return embed
@@ -564,6 +581,8 @@ class RateSelect(ui.Select):
                 label=lbl, value=str(s), emoji=emojis.get(s, "➖")))
         options.append(discord.SelectOption(
             label="Strike", value=str(rm + 1), emoji="🚫"))
+        options.append(discord.SelectOption(
+            label="Conflict", value=str(rm + 2), emoji="⚠️"))
         row = 2 if which == "a" else 3
         super().__init__(placeholder=f"Rate {side} directly…", options=options, row=row, min_values=1, max_values=1)
 
@@ -577,8 +596,15 @@ class RateSelect(ui.Select):
         judge = pair[0] if self.which == "a" else pair[1]
         raw = float(self.values[0])
         rm = session.rating_max
-        internal = _normalize_score(raw, rm)
-        label = "Strike" if raw >= rm + 1 else str(int(raw))
+        if raw >= rm + 2:
+            internal = 7.0
+            label = "Conflict"
+        elif raw >= rm + 1:
+            internal = 6.0
+            label = "Strike"
+        else:
+            internal = _normalize_score(raw, rm)
+            label = str(int(raw))
         session.scores_map[judge["name"]] = internal
 
         if internal >= 6.0:
@@ -642,14 +668,23 @@ class PairwiseView(ui.View):
 
     @ui.button(label="Strike A", style=discord.ButtonStyle.danger, row=1)
     async def strike_a(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "a")
+        await self._assign_special(interaction, "a", 6.0)
 
     @ui.button(label="Strike B", style=discord.ButtonStyle.danger, row=1)
     async def strike_b(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "b")
+        await self._assign_special(interaction, "b", 6.0)
 
-    async def _assign_special(self, interaction: discord.Interaction, which: str):
-        """Assign strike to a judge, removing them from comparisons."""
+    @ui.button(label="Conflict A", style=discord.ButtonStyle.secondary, row=1)
+    async def conflict_a(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign_special(interaction, "a", 7.0)
+
+    @ui.button(label="Conflict B", style=discord.ButtonStyle.secondary, row=1)
+    async def conflict_b(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign_special(interaction, "b", 7.0)
+
+    async def _assign_special(self, interaction: discord.Interaction, which: str,
+                              score: float = 6.0):
+        """Assign strike (6.0) or conflict (7.0) to a judge, removing them from comparisons."""
         session = self.session
         if not session.ranker:
             return
@@ -660,8 +695,9 @@ class PairwiseView(ui.View):
             await _finish_comparison(interaction.channel, session)
             return
         judge = pair[0] if which == "a" else pair[1]
-        session.scores_map[judge["name"]] = 6.0
-        session.ranker.remove_judge(judge, 6.0)
+        label = "Conflict" if score == 7.0 else "Strike"
+        session.scores_map[judge["name"]] = score
+        session.ranker.remove_judge(judge, score)
         if session.ranker.is_complete:
             self.stop()
             await interaction.response.edit_message(content="⏳ Finishing comparison…", embeds=[], view=None)
@@ -669,7 +705,7 @@ class PairwiseView(ui.View):
         else:
             info_embeds, para_embeds = _build_comparison_embeds(session)
             await interaction.response.edit_message(
-                content=f"✅ **{judge['name']}** marked as **Strike**.",
+                content=f"✅ **{judge['name']}** marked as **{label}**.",
                 embeds=info_embeds, view=self)
             await _update_paradigms(interaction.channel, session, para_embeds)
 
@@ -1380,7 +1416,7 @@ async def _finish_comparison(channel, session: PrefSession):
     special_lines = []
     for name, sc in session.scores_map.items():
         if name not in all_ranked_names and sc >= 6.0:
-            label = "Strike" if sc == 6.0 else "Conflict"
+            label = _score_label(sc)
             special_lines.append(f"🚫 **{name}** — **{label}**")
     if special_lines:
         lines.append("")
