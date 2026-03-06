@@ -161,6 +161,38 @@ def split_name(name: str) -> tuple[str, str]:
     return first, last
 
 
+def _parse_prefilled_rating(rating_str: str) -> float | None:
+    """Convert a CSV rating string to a score, or None if empty/invalid."""
+    s = rating_str.strip().upper()
+    if not s:
+        return None
+    if s == "S":
+        return 6.0
+    if s == "C":
+        return 7.0
+    try:
+        val = float(s)
+        if 1 <= val <= 7:
+            return round(val * 2) / 2
+        return None
+    except ValueError:
+        return None
+
+
+def _process_csv_prefilled(session: "PrefSession") -> int:
+    """Extract pre-filled ratings from CSV judges into scores_map.
+
+    Returns count of pre-filled judges.
+    """
+    count = 0
+    for judge in session.csv_judges:
+        score = _parse_prefilled_rating(judge.get("rating", ""))
+        if score is not None:
+            session.scores_map[judge["name"]] = score
+            count += 1
+    return count
+
+
 def _select_anchors(matched, count=4):
     """Pick a spread of anchor judges from matched list for Elo calibration."""
     if not matched:
@@ -198,6 +230,7 @@ class PrefSession:
         self.paradigms: dict[str, dict | None] = {}
         self.ranker: PairwiseRanker | None = None
         self.paradigm_messages: list = []  # messages to delete on next comparison
+        self.prefilled_unmatched: list[dict] = []  # pre-rated judges split from unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -805,11 +838,27 @@ async def on_message(message: discord.Message):
                     session.csv_judges = parse_tournament_csv(tmp.name)
                 finally:
                     os.unlink(tmp.name)
-                await message.channel.send(embed=discord.Embed(
-                    description=f"✅ Loaded **{len(session.csv_judges)}** judges from `{csv_attachment.filename}`.",
-                    color=EMBED_COLOR))
-                session.state = "awaiting_source_choice"
-                await _send_source_choice(message.channel)
+                prefilled_count = _process_csv_prefilled(session)
+                total = len(session.csv_judges)
+                if prefilled_count == total:
+                    await message.channel.send(embed=discord.Embed(
+                        description=f"✅ Loaded **{total}** judges from `{csv_attachment.filename}`.\n"
+                                    f"📋 All **{total}** judges have pre-filled ratings. "
+                                    f"Proceeding to quota setup…",
+                        color=SUCCESS_COLOR))
+                    session.matched = []
+                    session.unmatched = list(session.csv_judges)
+                    session.state = "awaiting_quota_mode"
+                    await send_quota_mode_prompt(message.channel, session)
+                else:
+                    desc = f"✅ Loaded **{total}** judges from `{csv_attachment.filename}`."
+                    if prefilled_count > 0:
+                        desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
+                                 f"(treated as anchors).")
+                    await message.channel.send(embed=discord.Embed(
+                        description=desc, color=EMBED_COLOR))
+                    session.state = "awaiting_source_choice"
+                    await _send_source_choice(message.channel)
             else:
                 embed = discord.Embed(
                     title="📋 Prefessor Judge",
@@ -902,11 +951,26 @@ async def handle_state(message: discord.Message, session: PrefSession):
         finally:
             os.unlink(tmp.name)
 
-        await channel.send(embed=discord.Embed(
-            description=f"✅ Loaded **{len(session.csv_judges)}** judges from `{attachment.filename}`.",
-            color=EMBED_COLOR))
-        session.state = "awaiting_source_choice"
-        await _send_source_choice(channel)
+        prefilled_count = _process_csv_prefilled(session)
+        total = len(session.csv_judges)
+        if prefilled_count == total:
+            await channel.send(embed=discord.Embed(
+                description=f"✅ Loaded **{total}** judges from `{attachment.filename}`.\n"
+                            f"📋 All **{total}** judges have pre-filled ratings. "
+                            f"Proceeding to quota setup…",
+                color=SUCCESS_COLOR))
+            session.matched = []
+            session.unmatched = list(session.csv_judges)
+            session.state = "awaiting_quota_mode"
+            await send_quota_mode_prompt(channel, session)
+        else:
+            desc = f"✅ Loaded **{total}** judges from `{attachment.filename}`."
+            if prefilled_count > 0:
+                desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
+                         f"(treated as anchors).")
+            await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+            session.state = "awaiting_source_choice"
+            await _send_source_choice(channel)
 
     # --- Awaiting source choice (Notion vs scratch) ---
     elif session.state == "awaiting_source_choice":
@@ -916,9 +980,15 @@ async def handle_state(message: discord.Message, session: PrefSession):
             await channel.send(embed=discord.Embed(
                 description="🔍 Fetching absolute scores from Notion…", color=EMBED_COLOR))
             session.notion_judges = fetch_notion_judges()
-            session.matched, session.unmatched = match_judges(session.csv_judges, session.notion_judges)
+            session.matched, all_unmatched = match_judges(session.csv_judges, session.notion_judges)
+            # Split pre-filled judges out of unmatched
+            session.prefilled_unmatched = [j for j in all_unmatched if j["name"] in session.scores_map]
+            session.unmatched = [j for j in all_unmatched if j["name"] not in session.scores_map]
             summary = discord.Embed(title="📊 Match Results", color=EMBED_COLOR)
             summary.add_field(name="✅ Matched", value=str(len(session.matched)), inline=True)
+            if session.prefilled_unmatched:
+                summary.add_field(name="📋 Pre-filled",
+                                  value=str(len(session.prefilled_unmatched)), inline=True)
             summary.add_field(name="❓ Unmatched", value=str(len(session.unmatched)), inline=True)
             summary.add_field(name="📚 Notion DB", value=str(len(session.notion_judges)), inline=True)
             await channel.send(embed=summary)
@@ -932,12 +1002,24 @@ async def handle_state(message: discord.Message, session: PrefSession):
         elif text == "2" or "scratch" in text.lower() or "fresh" in text.lower():
             session.notion_judges = []
             session.matched = []
-            session.unmatched = list(session.csv_judges)
-            await channel.send(embed=discord.Embed(
-                description=f"📝 Ranking from scratch — **{len(session.unmatched)}** judges to rate.",
-                color=EMBED_COLOR))
-            session.state = "awaiting_unmatched_choice"
-            await _send_unmatched_prompt(channel, session)
+            all_judges = list(session.csv_judges)
+            session.prefilled_unmatched = [j for j in all_judges if j["name"] in session.scores_map]
+            session.unmatched = [j for j in all_judges if j["name"] not in session.scores_map]
+            if not session.unmatched:
+                await channel.send(embed=discord.Embed(
+                    description="📋 All judges already have pre-filled ratings. "
+                                "Proceeding to quota setup…",
+                    color=SUCCESS_COLOR))
+                session.state = "awaiting_quota_mode"
+                await send_quota_mode_prompt(channel, session)
+            else:
+                desc = f"📝 Ranking from scratch — **{len(session.unmatched)}** judges to rate."
+                if session.prefilled_unmatched:
+                    desc += (f"\n📋 **{len(session.prefilled_unmatched)}** judge(s) have "
+                             f"pre-filled ratings (anchors).")
+                await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+                session.state = "awaiting_unmatched_choice"
+                await _send_unmatched_prompt(channel, session)
 
         else:
             await channel.send(embed=discord.Embed(
@@ -989,6 +1071,17 @@ async def handle_state(message: discord.Message, session: PrefSession):
                     session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
                 await loading.delete()
             anchors = _select_anchors(session.matched)
+            # Override anchor scores with pre-filled CSV ratings
+            for anchor in anchors:
+                prefilled = session.scores_map.get(anchor["name"])
+                if prefilled is not None:
+                    anchor["score"] = prefilled
+            # Add pre-filled unmatched judges as additional anchors
+            for j in session.prefilled_unmatched:
+                score = session.scores_map.get(j["name"])
+                if score is not None and score < 6.0:
+                    anchors.append({"name": j["name"], "school": j["school"],
+                                    "rounds": j["rounds"], "score": score})
             session.ranker = PairwiseRanker(session.unmatched, anchors)
             session.state = "comparing"
             intro = discord.Embed(
@@ -1257,6 +1350,12 @@ async def run_assignment(channel, session: PrefSession):
             "rounds": csv_judge["rounds"], "score": final_score,
             "notion_name": notion_name})
     for judge in session.unmatched:
+        score = session.scores_map.get(judge["name"], 4.0)
+        all_judges.append({
+            "name": judge["name"], "school": judge["school"],
+            "rounds": judge["rounds"], "score": score,
+            "notion_name": None})
+    for judge in session.prefilled_unmatched:
         score = session.scores_map.get(judge["name"], 4.0)
         all_judges.append({
             "name": judge["name"], "school": judge["school"],
