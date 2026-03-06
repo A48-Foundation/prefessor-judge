@@ -338,6 +338,9 @@ class ScoringView(ui.View):
         # Strike button
         self.add_item(ScoreButton(float(rm + 1), f"{rm + 1} Strike",
                                   discord.ButtonStyle.danger))
+        # Conflict button
+        self.add_item(ScoreButton(float(rm + 2), "C Conflict",
+                                  discord.ButtonStyle.secondary))
 
     @ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=2)
     async def prev_button(self, interaction: discord.Interaction, button: ui.Button):
