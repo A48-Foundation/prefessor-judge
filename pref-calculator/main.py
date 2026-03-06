@@ -336,10 +336,10 @@ class ScoringView(ui.View):
                 style = discord.ButtonStyle.secondary
             self.add_item(ScoreButton(float(s), str(s), style))
         # Strike button
-        self.add_item(ScoreButton(float(rm + 1), f"{rm + 1} Strike",
+        self.add_item(ScoreButton(float(rm + 1), "Strike",
                                   discord.ButtonStyle.danger))
         # Conflict button
-        self.add_item(ScoreButton(float(rm + 2), "C Conflict",
+        self.add_item(ScoreButton(float(rm + 2), "Conflict",
                                   discord.ButtonStyle.secondary))
 
     @ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=2)
@@ -1142,7 +1142,7 @@ async def handle_state(message: discord.Message, session: PrefSession):
             view = ScoringView(session)
             rm = session.rating_max
             intro = discord.Embed(
-                title="🎯 Score Unknown Judges",
+                title="🎯 Direct Rating",
                 description=f"**{total}** judges need scores.\n"
                             f"Use the buttons below to score each judge (1–{rm}).\n"
                             f"• **1** = Best  • **{rm}** = Worst  • **{rm + 1}** = Strike\n"
@@ -1353,7 +1353,7 @@ async def _send_unmatched_prompt(channel, session: PrefSession):
     await channel.send(embed=discord.Embed(
         title="❓ Unmatched Judges",
         description=f"**{len(session.unmatched)}** judge(s) not found in the database.\n\n"
-                    "**1.** Rate each judge manually (interactive buttons)\n"
+                    "**1.** Direct rating (interactive buttons)\n"
                     "**2.** Pairwise compare\n"
                     "**3.** Skip — leave their ratings empty\n\n"
                     "Enter **1**, **2**, or **3**:",
