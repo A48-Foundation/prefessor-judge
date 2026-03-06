@@ -1159,18 +1159,40 @@ async def _finish_comparison(channel, session: PrefSession):
     for judge, score in scores:
         session.scores_map[judge["name"]] = score
 
-    lines = []
-    score_map = {j["name"]: s for j, s in scores}
-    for rank, (judge, elo) in enumerate(rankings, 1):
-        existing = session.scores_map.get(judge["name"])
-        if existing in (6.0, 7.0):
-            label = "Strike" if existing == 6.0 else "Conflict"
-        else:
-            label = str(score_map.get(judge["name"], "?"))
-        lines.append(f"`#{rank}` **{judge['name']}** — Score: **{label}** (Elo: {elo:.0f})")
+    # Build combined ranked list: directly rated + pairwise ranked, sorted by score
+    rated_judges = []  # (name, score, source)
+    pairwise_names = set()
 
-    # Append struck/conflicted judges that were removed during comparison
-    all_ranked_names = {j["name"] for j, _ in rankings}
+    # Pairwise-ranked judges (from Elo)
+    score_map = {j["name"]: s for j, s in scores}
+    for judge, elo in rankings:
+        sc = session.scores_map.get(judge["name"])
+        if sc in (6.0, 7.0):
+            continue  # handled separately
+        rated_judges.append((judge["name"], score_map.get(judge["name"], 3.0), f"Elo: {elo:.0f}"))
+        pairwise_names.add(judge["name"])
+
+    # Directly rated judges (promoted to anchors during session)
+    for anchor in session.ranker.anchors:
+        name = anchor["name"]
+        sc = anchor.get("score")
+        if name in pairwise_names or sc is None:
+            continue
+        if session.scores_map.get(name) in (6.0, 7.0):
+            continue  # handled separately
+        # Only include judges that were from this session's CSV (not original Notion anchors)
+        if any(j["name"] == name for j in session.csv_judges):
+            rated_judges.append((name, sc, "Rated directly"))
+
+    # Sort all rated judges by score (best first)
+    rated_judges.sort(key=lambda x: x[1])
+
+    lines = []
+    for rank, (name, sc, source) in enumerate(rated_judges, 1):
+        lines.append(f"`#{rank}` **{name}** — Score: **{sc}** ({source})")
+
+    # Append struck/conflicted judges
+    all_ranked_names = {name for name, _, _ in rated_judges}
     special_lines = []
     for name, sc in session.scores_map.items():
         if name not in all_ranked_names and sc in (6.0, 7.0):
@@ -1180,8 +1202,10 @@ async def _finish_comparison(channel, session: PrefSession):
         lines.append("")
         lines.extend(special_lines)
 
-    total = len(rankings) + len(special_lines)
-    embed = discord.Embed(title=f"📊 Comparison Results ({total} judges: {len(rankings)} ranked, {len(special_lines)} struck/conflicted)", color=SUCCESS_COLOR)
+    total = len(rated_judges) + len(special_lines)
+    embed = discord.Embed(
+        title=f"📊 Comparison Results ({total} judges: {len(rated_judges)} ranked, {len(special_lines)} struck/conflicted)",
+        color=SUCCESS_COLOR)
 
     # Split across multiple fields to avoid 1024-char limit
     chunk = []

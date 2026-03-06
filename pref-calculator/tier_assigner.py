@@ -76,6 +76,7 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
     The partition is sequential: first k5 judges → tier 5, next k4 → tier 4, etc.
     Searches all valid (k5, k4, k3, k2) combinations; k1 = remainder.
     Minimises total deviation from natural tiers among feasible solutions.
+    Enforces ±1 tier constraint: no judge moves more than 1 tier from natural.
 
     Returns True if a feasible partition was found and applied, False otherwise.
     """
@@ -84,22 +85,19 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
         return True
 
     costs = [1 if quota_mode == "judges" else j["rounds"] for j in rateable]
-    # Prefix sums for O(1) range-cost queries
     prefix = [0] * (N + 1)
     for i in range(N):
         prefix[i + 1] = prefix[i] + costs[i]
 
-    tiers = [5, 4, 3, 2, 1]  # bottom-up order
+    tiers = [5, 4, 3, 2, 1]
     t_min = [quotas.get(t, {}).get("min", 0) for t in tiers]
     t_max = [quotas.get(t, {}).get("max", float("inf")) for t in tiers]
 
-    # Quick feasibility check
     total_available = prefix[N]
     total_min_needed = sum(t_min)
     if total_available < total_min_needed:
-        return False  # mathematically impossible
+        return False
 
-    # Suffix sums of tier minimums for look-ahead pruning
     sfx_min = [0] * (len(tiers) + 1)
     for i in range(len(tiers) - 1, -1, -1):
         sfx_min[i] = sfx_min[i + 1] + t_min[i]
@@ -108,17 +106,21 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
     best = {"cuts": None, "dev": float("inf")}
 
     def search(ti, start, cuts, dev_so_far):
-        # Prune: can't beat current best
         if dev_so_far >= best["dev"]:
             return
 
         if ti == len(tiers) - 1:
-            # Last tier (tier 1) gets all remaining judges
             k = N - start
             s = prefix[N] - prefix[start]
             if s < t_min[ti] or s > t_max[ti]:
                 return
-            d = dev_so_far + sum(abs(1 - nat[j]) for j in range(start, N))
+            # Check ±1 constraint for remaining judges
+            d = 0
+            for j in range(start, N):
+                if abs(1 - nat[j]) > 1:
+                    return  # violates ±1 constraint
+                d += abs(1 - nat[j])
+            d += dev_so_far
             if d < best["dev"]:
                 best["dev"] = d
                 best["cuts"] = cuts + (k,)
@@ -131,16 +133,17 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
 
         for k in range(N - start + 1):
             if k > 0:
-                cumcost += costs[start + k - 1]
-                tier_dev += abs(tier - nat[start + k - 1])
-            # Prune: exceeded tier max
+                idx = start + k - 1
+                # Check ±1 constraint for this judge in this tier
+                if abs(tier - nat[idx]) > 1:
+                    break  # sorted order means all subsequent will also violate
+                cumcost += costs[idx]
+                tier_dev += abs(tier - nat[idx])
             if cumcost > t_max[ti]:
                 break
-            # Prune: not enough left for tiers above
             remaining = prefix[N] - prefix[start + k]
             if remaining < min_above:
                 break
-            # Only recurse when this tier's minimum is satisfied
             if cumcost >= t_min[ti]:
                 search(ti + 1, start + k, cuts + (k,), dev_so_far + tier_dev)
 
@@ -149,7 +152,6 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
     if best["cuts"] is None:
         return False
 
-    # Apply the optimal partition
     idx = 0
     for ti, k in enumerate(best["cuts"]):
         for _ in range(k):
@@ -159,11 +161,10 @@ def _find_optimal_partition(rateable, quotas, quota_mode):
 
 
 def _flexible_assign(rateable, quotas, quota_mode):
-    """Flexible assignment allowing any judge to go to any tier 1-5.
+    """Flexible assignment with ±1 tier constraint.
 
     Uses iterative repair: starts at natural tiers, then moves judges
-    between tiers to fix deficits. Judges can be promoted or demoted
-    freely to satisfy quotas.
+    between adjacent tiers only (±1 from natural) to fix deficits.
 
     Returns True if all quotas were met, False otherwise.
     """
@@ -173,11 +174,11 @@ def _flexible_assign(rateable, quotas, quota_mode):
     for j in rateable:
         nt = natural_tier(j["score"])
         j["tier"] = max(1, min(5, nt))
+        j["_natural"] = j["tier"]  # remember natural tier for ±1 constraint
 
     max_iters = len(rateable) * 10
 
     for _ in range(max_iters):
-        # Compute totals, deficits, surpluses
         totals = {t: sum(cost_fn(j) for j in rateable if j["tier"] == t) for t in range(1, 6)}
         deficits = {}
         for t in range(1, 6):
@@ -186,24 +187,28 @@ def _flexible_assign(rateable, quotas, quota_mode):
             if totals[t] < t_min:
                 deficits[t] = t_min - totals[t]
             elif totals[t] > t_max:
-                deficits[t] = -(totals[t] - t_max)  # negative = over-max
+                deficits[t] = -(totals[t] - t_max)
 
         if not deficits:
-            return True  # All quotas met
+            # Clean up temp attribute
+            for j in rateable:
+                j.pop("_natural", None)
+            return True
 
-        # Pick most urgent deficit tier (largest under-min first, then over-max)
         under = {t: d for t, d in deficits.items() if d > 0}
         over = {t: -d for t, d in deficits.items() if d < 0}
 
         if over:
-            # Fix over-max first: move worst judge from over tier to best available
             target = max(over, key=over.get)
             judges_in = sorted([j for j in rateable if j["tier"] == target],
                                key=lambda j: -j["score"])
             moved = False
             for j in judges_in:
-                for dest in range(5, 0, -1):
-                    if dest == target:
+                # Only move to adjacent tiers within ±1 of natural
+                for dest in [target + 1, target - 1]:
+                    if dest < 1 or dest > 5 or dest == target:
+                        continue
+                    if abs(dest - j["_natural"]) > 1:
                         continue
                     d_max = quotas.get(dest, {}).get("max", float("inf"))
                     if totals[dest] + cost_fn(j) <= d_max:
@@ -213,13 +218,13 @@ def _flexible_assign(rateable, quotas, quota_mode):
                 if moved:
                     break
             if not moved:
+                for j in rateable:
+                    j.pop("_natural", None)
                 return False
             continue
 
-        # Fix under-min: move a judge TO the most deficit tier
         target = max(under, key=under.get)
 
-        # Find best movable judge: from a tier with surplus above its own minimum
         best_judge = None
         best_priority = float("inf")
         for src in range(1, 6):
@@ -229,34 +234,41 @@ def _flexible_assign(rateable, quotas, quota_mode):
             for j in rateable:
                 if j["tier"] != src:
                     continue
+                # ±1 constraint: target must be within 1 of natural tier
+                if abs(target - j["_natural"]) > 1:
+                    continue
                 if totals[src] - cost_fn(j) < src_min:
-                    continue  # would break source
-                # Prefer judge whose natural tier is closest to target
-                p = abs(natural_tier(j["score"]) - target) * 10 + abs(src - target)
+                    continue
+                p = abs(j["_natural"] - target) * 10 + abs(src - target)
                 if p < best_priority:
                     best_priority = p
                     best_judge = j
 
         if best_judge is None:
-            # All sources at minimum — force move from largest surplus tier
+            # Force move from largest surplus (still respecting ±1)
             surplus_tiers = sorted(range(1, 6),
                                    key=lambda t: totals[t] - quotas.get(t, {}).get("min", 0),
                                    reverse=True)
             for src in surplus_tiers:
                 if src == target:
                     continue
-                candidates = [j for j in rateable if j["tier"] == src]
+                candidates = [j for j in rateable if j["tier"] == src
+                              and abs(target - j["_natural"]) <= 1]
                 if candidates:
-                    candidates.sort(key=lambda j: abs(natural_tier(j["score"]) - target))
+                    candidates.sort(key=lambda j: abs(j["_natural"] - target))
                     best_judge = candidates[0]
                     break
 
         if best_judge is None:
-            return False  # truly stuck
+            for j in rateable:
+                j.pop("_natural", None)
+            return False
 
         best_judge["tier"] = target
 
-    return False  # didn't converge
+    for j in rateable:
+        j.pop("_natural", None)
+    return False
 
 
 def _greedy_fallback(rateable, quotas, quota_mode):
