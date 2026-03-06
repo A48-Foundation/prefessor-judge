@@ -27,7 +27,7 @@ from csv_writer import write_output_csv
 from pairwise_ranker import PairwiseRanker
 
 try:
-    from tabroom_scraper import TabroomScraper
+    from judge_scraper import TabroomScraper
     from tabroom_cache import TabroomCache
 except ImportError:
     TabroomScraper = None
@@ -140,7 +140,7 @@ def build_judge_embed(judge: dict, paradigm: dict | None, *, score: float | None
     embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
     embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
     if score is not None:
-        label = {6: "Strike", 7: "Conflict"}.get(int(score), str(score))
+        label = "Strike" if int(score) >= 6 else str(score)
         embed.add_field(name="⭐ Score", value=label, inline=True)
     url = tabroom_paradigm_url(judge["name"])
     if paradigm and paradigm.get("philosophy"):
@@ -161,20 +161,36 @@ def split_name(name: str) -> tuple[str, str]:
     return first, last
 
 
-def _parse_prefilled_rating(rating_str: str) -> float | None:
-    """Convert a CSV rating string to a score, or None if empty/invalid."""
+def _normalize_score(raw: float, rating_max: int) -> float:
+    """Normalize a raw score from [1, rating_max] to internal [1.0, 5.0].
+
+    Values >= rating_max + 1 map to 6.0 (strike).
+    For rating_max == 5 this is an identity.
+    """
+    if raw >= rating_max + 1:
+        return 6.0
+    if rating_max == 5:
+        return raw
+    return 1.0 + (raw - 1) * 4.0 / (rating_max - 1)
+
+
+def _parse_prefilled_rating(rating_str: str, rating_max: int = 5) -> float | None:
+    """Convert a CSV rating string to an internal score, or None if empty/invalid.
+
+    Values 1..rating_max are normalized to the internal 1-5 scale.
+    rating_max+1 and 'S' map to 6.0 (strike).
+    """
     s = rating_str.strip().upper()
     if not s:
         return None
     if s == "S":
         return 6.0
-    if s == "C":
-        return 7.0
     try:
         val = float(s)
-        if 1 <= val <= 7:
-            return round(val * 2) / 2
-        return None
+        if val < 1:
+            return None
+        internal = _normalize_score(val, rating_max)
+        return round(internal * 2) / 2  # snap to 0.5
     except ValueError:
         return None
 
@@ -186,7 +202,8 @@ def _process_csv_prefilled(session: "PrefSession") -> int:
     """
     count = 0
     for judge in session.csv_judges:
-        score = _parse_prefilled_rating(judge.get("rating", ""))
+        score = _parse_prefilled_rating(judge.get("rating", ""),
+                                        session.rating_max)
         if score is not None:
             session.scores_map[judge["name"]] = score
             count += 1
@@ -222,6 +239,7 @@ class PrefSession:
         self.unmatched: list[dict] = []
         self.skipped_judges: list[dict] = []
         self.scores_map: dict[str, float] = {}
+        self.rating_max: int = 5
         self.current_idx: int = 0
         self.quota_mode: str | None = None
         self.quotas: dict[int, dict] = {}
@@ -234,13 +252,45 @@ class PrefSession:
 
 
 # ---------------------------------------------------------------------------
+# Rating Range View
+# ---------------------------------------------------------------------------
+
+class RatingRangeView(ui.View):
+    """Let user choose the tournament's rating scale (e.g. 1-5, 1-6, 1-7)."""
+
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="1–5", style=discord.ButtonStyle.primary)
+    async def range_5(self, interaction: discord.Interaction, button: ui.Button):
+        await self._set_range(interaction, 5)
+
+    @ui.button(label="1–6", style=discord.ButtonStyle.primary)
+    async def range_6(self, interaction: discord.Interaction, button: ui.Button):
+        await self._set_range(interaction, 6)
+
+    @ui.button(label="1–7", style=discord.ButtonStyle.primary)
+    async def range_7(self, interaction: discord.Interaction, button: ui.Button):
+        await self._set_range(interaction, 7)
+
+    async def _set_range(self, interaction: discord.Interaction, max_val: int):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                description=f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})",
+                color=EMBED_COLOR), view=None)
+        await _apply_rating_range(interaction.channel, self.session, max_val)
+
+
+# ---------------------------------------------------------------------------
 # Interactive Views — Scoring
 # ---------------------------------------------------------------------------
 
 class ScoreButton(ui.Button):
-    def __init__(self, score: float, label: str, style: discord.ButtonStyle):
-        super().__init__(label=label, style=style, custom_id=f"score_{score}")
-        self.score = score
+    def __init__(self, raw_score: float, label: str, style: discord.ButtonStyle):
+        super().__init__(label=label, style=style, custom_id=f"score_{raw_score}")
+        self.raw_score = raw_score
 
     async def callback(self, interaction: discord.Interaction):
         view: ScoringView = self.view  # type: ignore
@@ -249,7 +299,7 @@ class ScoreButton(ui.Button):
             await interaction.response.send_message("Not your session.", ephemeral=True)
             return
         judge = session.unmatched[session.current_idx]
-        session.scores_map[judge["name"]] = self.score
+        session.scores_map[judge["name"]] = _normalize_score(self.raw_score, session.rating_max)
         session.current_idx += 1
         if session.current_idx < len(session.unmatched):
             await view.show_judge(interaction)
@@ -261,13 +311,18 @@ class ScoringView(ui.View):
     def __init__(self, session: PrefSession):
         super().__init__(timeout=None)
         self.session = session
-        styles = {1: discord.ButtonStyle.success, 2: discord.ButtonStyle.success,
-                  3: discord.ButtonStyle.primary, 4: discord.ButtonStyle.primary,
-                  5: discord.ButtonStyle.secondary, 6: discord.ButtonStyle.danger,
-                  7: discord.ButtonStyle.danger}
-        labels = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6 Strike", 7: "7 Conflict"}
-        for s in range(1, 8):
-            self.add_item(ScoreButton(float(s), labels[s], styles[s]))
+        rm = session.rating_max
+        for s in range(1, rm + 1):
+            if s <= rm * 0.4:
+                style = discord.ButtonStyle.success
+            elif s <= rm * 0.8:
+                style = discord.ButtonStyle.primary
+            else:
+                style = discord.ButtonStyle.secondary
+            self.add_item(ScoreButton(float(s), str(s), style))
+        # Strike button
+        self.add_item(ScoreButton(float(rm + 1), f"{rm + 1} Strike",
+                                  discord.ButtonStyle.danger))
 
     @ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=2)
     async def prev_button(self, interaction: discord.Interaction, button: ui.Button):
@@ -275,10 +330,10 @@ class ScoringView(ui.View):
             self.session.current_idx -= 1
         await self.show_judge(interaction)
 
-    @ui.button(label="⏭ Skip (4.0)", style=discord.ButtonStyle.secondary, row=2)
+    @ui.button(label="⏭ Skip", style=discord.ButtonStyle.secondary, row=2)
     async def skip_button(self, interaction: discord.Interaction, button: ui.Button):
         judge = self.session.unmatched[self.session.current_idx]
-        self.session.scores_map[judge["name"]] = 4.0
+        self.session.scores_map[judge["name"]] = 4.0  # internal: below average
         self.session.current_idx += 1
         if self.session.current_idx < len(self.session.unmatched):
             await self.show_judge(interaction)
@@ -307,7 +362,7 @@ class ScoringView(ui.View):
         embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
         embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
         if existing_score is not None:
-            label = {6: "Strike", 7: "Conflict"}.get(int(existing_score), str(existing_score))
+            label = "Strike" if int(existing_score) >= 6 else str(existing_score)
             embed.add_field(name="⭐ Score", value=label, inline=True)
         url = tabroom_paradigm_url(judge["name"])
         embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
@@ -420,7 +475,7 @@ class ReviewEditSelect(ui.Select):
 
 
 class ReScoreModal(ui.Modal, title="Re-score Judge"):
-    score_input = ui.TextInput(label="Score (1-7, 0.5 increments)", placeholder="e.g. 3 or 3.5",
+    score_input = ui.TextInput(label="Score", placeholder="e.g. 3 or 3.5, or S for strike",
                                max_length=4, required=True)
 
     def __init__(self, session: PrefSession, judge: dict):
@@ -429,17 +484,25 @@ class ReScoreModal(ui.Modal, title="Re-score Judge"):
         self.judge = judge
         current = session.scores_map.get(judge["name"], 4.0)
         self.score_input.default = str(current)
+        rm = session.rating_max
+        self.score_input.label = f"Score (1-{rm}, or {rm + 1}/S for strike)"
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            score = float(self.score_input.value.strip())
-            if score < 1 or score > 7:
-                await interaction.response.send_message("Score must be 1-7.", ephemeral=True)
+        rm = self.session.rating_max
+        raw_text = self.score_input.value.strip().upper()
+        if raw_text == "S":
+            score = 6.0
+        else:
+            try:
+                raw = float(raw_text)
+                if raw < 1 or raw > rm + 1:
+                    await interaction.response.send_message(
+                        f"Score must be 1-{rm} (or {rm + 1} for strike).", ephemeral=True)
+                    return
+                score = _normalize_score(round(raw * 2) / 2, rm)
+            except ValueError:
+                await interaction.response.send_message("Invalid number.", ephemeral=True)
                 return
-            score = round(score * 2) / 2
-        except ValueError:
-            await interaction.response.send_message("Invalid number.", ephemeral=True)
-            return
         self.session.scores_map[self.judge["name"]] = score
         view: ReviewView = self.session._review_view  # type: ignore
         embed = view.build_summary_embed()
@@ -461,7 +524,7 @@ class ReviewView(ui.View):
         lines = []
         for j in self.session.unmatched:
             score = self.session.scores_map.get(j["name"], 4.0)
-            label = {6.0: "Strike", 7.0: "Conflict"}.get(score, str(score))
+            label = "Strike" if score >= 6.0 else str(score)
             lines.append(f"• **{j['name']}** ({j['school']}) — {label}")
         embed.add_field(name="Scored Judges", value="\n".join(lines) or "None", inline=False)
         return embed
@@ -478,20 +541,29 @@ class ReviewView(ui.View):
 # ---------------------------------------------------------------------------
 
 class RateSelect(ui.Select):
-    """Dropdown to directly rate Judge A or B (1-5, Strike, Conflict)."""
+    """Dropdown to directly rate Judge A or B on the session's rating scale."""
     def __init__(self, which: str, session: PrefSession):
         self.which = which  # "a" or "b"
         self.session = session
+        rm = session.rating_max
         side = "🅰️ Judge A" if which == "a" else "🅱️ Judge B"
-        options = [
-            discord.SelectOption(label="1 — Best", value="1", emoji="⭐"),
-            discord.SelectOption(label="2 — Good", value="2", emoji="👍"),
-            discord.SelectOption(label="3 — Average", value="3", emoji="➖"),
-            discord.SelectOption(label="4 — Below Average", value="4", emoji="👎"),
-            discord.SelectOption(label="5 — Worst", value="5", emoji="⛔"),
-            discord.SelectOption(label="Strike", value="6", emoji="🚫"),
-            discord.SelectOption(label="Conflict", value="7", emoji="⚠️"),
-        ]
+        emojis = {1: "⭐", rm: "⛔"}
+        options = []
+        for s in range(1, rm + 1):
+            if s == 1:
+                lbl = f"{s} — Best"
+            elif s == rm:
+                lbl = f"{s} — Worst"
+            elif s <= rm // 2:
+                lbl = f"{s} — Good"
+            elif s == (rm + 1) // 2:
+                lbl = f"{s} — Average"
+            else:
+                lbl = f"{s} — Below Average"
+            options.append(discord.SelectOption(
+                label=lbl, value=str(s), emoji=emojis.get(s, "➖")))
+        options.append(discord.SelectOption(
+            label="Strike", value=str(rm + 1), emoji="🚫"))
         row = 2 if which == "a" else 3
         super().__init__(placeholder=f"Rate {side} directly…", options=options, row=row, min_values=1, max_values=1)
 
@@ -503,14 +575,16 @@ class RateSelect(ui.Select):
         if not pair:
             return
         judge = pair[0] if self.which == "a" else pair[1]
-        score = float(self.values[0])
-        label = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "Strike", 7: "Conflict"}.get(int(score), str(score))
-        session.scores_map[judge["name"]] = score
+        raw = float(self.values[0])
+        rm = session.rating_max
+        internal = _normalize_score(raw, rm)
+        label = "Strike" if raw >= rm + 1 else str(int(raw))
+        session.scores_map[judge["name"]] = internal
 
-        if score in (6.0, 7.0):
-            session.ranker.remove_judge(judge, score)
+        if internal >= 6.0:
+            session.ranker.remove_judge(judge, internal)
         else:
-            session.ranker.rate_judge(judge, score)
+            session.ranker.rate_judge(judge, internal)
 
         if session.ranker.is_complete:
             self.view.stop()
@@ -568,22 +642,14 @@ class PairwiseView(ui.View):
 
     @ui.button(label="Strike A", style=discord.ButtonStyle.danger, row=1)
     async def strike_a(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "a", 6.0)
+        await self._assign_special(interaction, "a")
 
     @ui.button(label="Strike B", style=discord.ButtonStyle.danger, row=1)
     async def strike_b(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "b", 6.0)
+        await self._assign_special(interaction, "b")
 
-    @ui.button(label="Conflict A", style=discord.ButtonStyle.secondary, row=1)
-    async def conflict_a(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "a", 7.0)
-
-    @ui.button(label="Conflict B", style=discord.ButtonStyle.secondary, row=1)
-    async def conflict_b(self, interaction: discord.Interaction, button: ui.Button):
-        await self._assign_special(interaction, "b", 7.0)
-
-    async def _assign_special(self, interaction: discord.Interaction, which: str, score: float):
-        """Assign strike (6) or conflict (7) to a judge, removing them from comparisons."""
+    async def _assign_special(self, interaction: discord.Interaction, which: str):
+        """Assign strike to a judge, removing them from comparisons."""
         session = self.session
         if not session.ranker:
             return
@@ -594,9 +660,8 @@ class PairwiseView(ui.View):
             await _finish_comparison(interaction.channel, session)
             return
         judge = pair[0] if which == "a" else pair[1]
-        label = "Strike" if score == 6.0 else "Conflict"
-        session.scores_map[judge["name"]] = score
-        session.ranker.remove_judge(judge, score)
+        session.scores_map[judge["name"]] = 6.0
+        session.ranker.remove_judge(judge, 6.0)
         if session.ranker.is_complete:
             self.stop()
             await interaction.response.edit_message(content="⏳ Finishing comparison…", embeds=[], view=None)
@@ -604,7 +669,7 @@ class PairwiseView(ui.View):
         else:
             info_embeds, para_embeds = _build_comparison_embeds(session)
             await interaction.response.edit_message(
-                content=f"✅ **{judge['name']}** marked as **{label}**.",
+                content=f"✅ **{judge['name']}** marked as **Strike**.",
                 embeds=info_embeds, view=self)
             await _update_paradigms(interaction.channel, session, para_embeds)
 
@@ -838,27 +903,12 @@ async def on_message(message: discord.Message):
                     session.csv_judges = parse_tournament_csv(tmp.name)
                 finally:
                     os.unlink(tmp.name)
-                prefilled_count = _process_csv_prefilled(session)
                 total = len(session.csv_judges)
-                if prefilled_count == total:
-                    await message.channel.send(embed=discord.Embed(
-                        description=f"✅ Loaded **{total}** judges from `{csv_attachment.filename}`.\n"
-                                    f"📋 All **{total}** judges have pre-filled ratings. "
-                                    f"Proceeding to quota setup…",
-                        color=SUCCESS_COLOR))
-                    session.matched = []
-                    session.unmatched = list(session.csv_judges)
-                    session.state = "awaiting_quota_mode"
-                    await send_quota_mode_prompt(message.channel, session)
-                else:
-                    desc = f"✅ Loaded **{total}** judges from `{csv_attachment.filename}`."
-                    if prefilled_count > 0:
-                        desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
-                                 f"(treated as anchors).")
-                    await message.channel.send(embed=discord.Embed(
-                        description=desc, color=EMBED_COLOR))
-                    session.state = "awaiting_source_choice"
-                    await _send_source_choice(message.channel)
+                await message.channel.send(embed=discord.Embed(
+                    description=f"✅ Loaded **{total}** judges from `{csv_attachment.filename}`.",
+                    color=EMBED_COLOR))
+                session.state = "awaiting_rating_range"
+                await _send_rating_range_prompt(message.channel, session)
             else:
                 embed = discord.Embed(
                     title="📋 Prefessor Judge",
@@ -951,26 +1001,28 @@ async def handle_state(message: discord.Message, session: PrefSession):
         finally:
             os.unlink(tmp.name)
 
-        prefilled_count = _process_csv_prefilled(session)
         total = len(session.csv_judges)
-        if prefilled_count == total:
+        await channel.send(embed=discord.Embed(
+            description=f"✅ Loaded **{total}** judges from `{attachment.filename}`.",
+            color=EMBED_COLOR))
+        session.state = "awaiting_rating_range"
+        await _send_rating_range_prompt(channel, session)
+
+    # --- Awaiting rating range ---
+    elif session.state == "awaiting_rating_range":
+        text = message.content.strip()
+        try:
+            val = int(text)
+            if val < 2 or val > 20:
+                await channel.send(embed=discord.Embed(
+                    description="Please enter a number between 2 and 20, or use the buttons.",
+                    color=WARN_COLOR))
+                return
+            await _apply_rating_range(channel, session, val)
+        except ValueError:
             await channel.send(embed=discord.Embed(
-                description=f"✅ Loaded **{total}** judges from `{attachment.filename}`.\n"
-                            f"📋 All **{total}** judges have pre-filled ratings. "
-                            f"Proceeding to quota setup…",
-                color=SUCCESS_COLOR))
-            session.matched = []
-            session.unmatched = list(session.csv_judges)
-            session.state = "awaiting_quota_mode"
-            await send_quota_mode_prompt(channel, session)
-        else:
-            desc = f"✅ Loaded **{total}** judges from `{attachment.filename}`."
-            if prefilled_count > 0:
-                desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
-                         f"(treated as anchors).")
-            await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
-            session.state = "awaiting_source_choice"
-            await _send_source_choice(channel)
+                description="Please enter a number (e.g. **5** for a 1-5 scale) or use the buttons.",
+                color=WARN_COLOR))
 
     # --- Awaiting source choice (Notion vs scratch) ---
     elif session.state == "awaiting_source_choice":
@@ -1049,11 +1101,12 @@ async def handle_state(message: discord.Message, session: PrefSession):
             embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
             embed.set_footer(text=f"Progress: 1/{total}")
             view = ScoringView(session)
+            rm = session.rating_max
             intro = discord.Embed(
                 title="🎯 Score Unknown Judges",
                 description=f"**{total}** judges need scores.\n"
-                            "Use the buttons below to score each judge (1-7).\n"
-                            "• **1** = Best  • **5** = Worst  • **6** = Strike  • **7** = Conflict\n"
+                            f"Use the buttons below to score each judge (1–{rm}).\n"
+                            f"• **1** = Best  • **{rm}** = Worst  • **{rm + 1}** = Strike\n"
                             "• Use **Compare** to view two judges side-by-side\n"
                             "• Use **Previous** to go back and change a score",
                 color=EMBED_COLOR)
@@ -1209,6 +1262,43 @@ async def _update_paradigms(channel, session: PrefSession, para_embeds: list):
             pass
 
 
+async def _send_rating_range_prompt(channel, session: PrefSession):
+    """Prompt user to choose the tournament's rating scale."""
+    embed = discord.Embed(
+        title="📏 Rating Scale",
+        description="What is the **maximum rating** for this tournament?\n"
+                    "(Judges are rated 1 to max; strike = max + 1)\n\n"
+                    "Use the buttons below or type a number.",
+        color=EMBED_COLOR)
+    await channel.send(embed=embed, view=RatingRangeView(session))
+
+
+async def _apply_rating_range(channel, session: PrefSession, max_val: int):
+    """Apply the selected rating range and proceed with pre-filled processing."""
+    session.rating_max = max_val
+    prefilled_count = _process_csv_prefilled(session)
+    total = len(session.csv_judges)
+
+    if prefilled_count == total:
+        session.matched = []
+        session.unmatched = list(session.csv_judges)
+        session.state = "awaiting_quota_mode"
+        await channel.send(embed=discord.Embed(
+            description=f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})\n"
+                        f"📋 All **{total}** judges have pre-filled ratings. "
+                        f"Proceeding to quota setup…",
+            color=SUCCESS_COLOR))
+        await send_quota_mode_prompt(channel, session)
+    else:
+        desc = f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})"
+        if prefilled_count > 0:
+            desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
+                     f"(treated as anchors).")
+        await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+        session.state = "awaiting_source_choice"
+        await _send_source_choice(channel)
+
+
 async def _send_source_choice(channel):
     """Prompt user to choose between Notion database or ranking from scratch."""
     await channel.send(embed=discord.Embed(
@@ -1260,7 +1350,7 @@ async def _finish_comparison(channel, session: PrefSession):
     score_map = {j["name"]: s for j, s in scores}
     for judge, elo in rankings:
         sc = session.scores_map.get(judge["name"])
-        if sc in (6.0, 7.0):
+        if sc is not None and sc >= 6.0:
             continue  # handled separately
         rated_judges.append((judge["name"], score_map.get(judge["name"], 3.0), f"Elo: {elo:.0f}"))
         pairwise_names.add(judge["name"])
@@ -1271,7 +1361,8 @@ async def _finish_comparison(channel, session: PrefSession):
         sc = anchor.get("score")
         if name in pairwise_names or sc is None:
             continue
-        if session.scores_map.get(name) in (6.0, 7.0):
+        sm_score = session.scores_map.get(name)
+        if sm_score is not None and sm_score >= 6.0:
             continue  # handled separately
         # Only include judges that were from this session's CSV (not original Notion anchors)
         if any(j["name"] == name for j in session.csv_judges):
@@ -1288,7 +1379,7 @@ async def _finish_comparison(channel, session: PrefSession):
     all_ranked_names = {name for name, _, _ in rated_judges}
     special_lines = []
     for name, sc in session.scores_map.items():
-        if name not in all_ranked_names and sc in (6.0, 7.0):
+        if name not in all_ranked_names and sc >= 6.0:
             label = "Strike" if sc == 6.0 else "Conflict"
             special_lines.append(f"🚫 **{name}** — **{label}**")
     if special_lines:
