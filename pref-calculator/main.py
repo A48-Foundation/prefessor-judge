@@ -1063,143 +1063,16 @@ async def handle_state(message: discord.Message, session: PrefSession):
                 description="Please enter a number (e.g. **5** for a 1-5 scale) or use the buttons.",
                 color=WARN_COLOR))
 
-    # --- Awaiting source choice (Notion vs scratch) ---
+    # --- Awaiting source choice (handled by buttons, text fallback) ---
     elif session.state == "awaiting_source_choice":
-        text = message.content.strip()
+        await channel.send(embed=discord.Embed(
+            description="Please use the buttons above to choose a rating source.", color=WARN_COLOR))
 
-        if text == "1" or "notion" in text.lower() or "database" in text.lower():
-            await channel.send(embed=discord.Embed(
-                description="🔍 Fetching absolute scores from Notion…", color=EMBED_COLOR))
-            session.notion_judges = fetch_notion_judges()
-            session.matched, all_unmatched = match_judges(session.csv_judges, session.notion_judges)
-            # Split pre-filled judges out of unmatched
-            session.prefilled_unmatched = [j for j in all_unmatched if j["name"] in session.scores_map]
-            session.unmatched = [j for j in all_unmatched if j["name"] not in session.scores_map]
-            summary = discord.Embed(title="📊 Match Results", color=EMBED_COLOR)
-            summary.add_field(name="✅ Matched", value=str(len(session.matched)), inline=True)
-            if session.prefilled_unmatched:
-                summary.add_field(name="📋 Pre-filled",
-                                  value=str(len(session.prefilled_unmatched)), inline=True)
-            summary.add_field(name="❓ Unmatched", value=str(len(session.unmatched)), inline=True)
-            summary.add_field(name="📚 Notion DB", value=str(len(session.notion_judges)), inline=True)
-            await channel.send(embed=summary)
-            if session.unmatched:
-                session.state = "awaiting_unmatched_choice"
-                await _send_unmatched_prompt(channel, session)
-            else:
-                session.state = "awaiting_quota_mode"
-                await send_quota_mode_prompt(channel, session)
-
-        elif text == "2" or "scratch" in text.lower() or "fresh" in text.lower():
-            session.notion_judges = []
-            session.matched = []
-            all_judges = list(session.csv_judges)
-            session.prefilled_unmatched = [j for j in all_judges if j["name"] in session.scores_map]
-            session.unmatched = [j for j in all_judges if j["name"] not in session.scores_map]
-            if not session.unmatched:
-                await channel.send(embed=discord.Embed(
-                    description="📋 All judges already have pre-filled ratings. "
-                                "Proceeding to quota setup…",
-                    color=SUCCESS_COLOR))
-                session.state = "awaiting_quota_mode"
-                await send_quota_mode_prompt(channel, session)
-            else:
-                desc = f"📝 Ranking from scratch — **{len(session.unmatched)}** judges to rate."
-                if session.prefilled_unmatched:
-                    desc += (f"\n📋 **{len(session.prefilled_unmatched)}** judge(s) have "
-                             f"pre-filled ratings (anchors).")
-                await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
-                session.state = "awaiting_unmatched_choice"
-                await _send_unmatched_prompt(channel, session)
-
-        else:
-            await channel.send(embed=discord.Embed(
-                description="Please enter **1** (Notion database) or **2** (rank from scratch).",
-                color=WARN_COLOR))
-
-    # --- Awaiting choice for unmatched judges ---
+    # --- Awaiting unmatched choice (handled by buttons, text fallback) ---
     elif session.state == "awaiting_unmatched_choice":
-        text = message.content.strip()
-
-        if text == "1" or "rate" in text.lower() or "manual" in text.lower():
-            session.state = "prompting_scores"
-            session.current_idx = 0
-            if tabroom_scraper and tabroom_cache:
-                loading = await channel.send(embed=discord.Embed(
-                    description="🌐 Fetching Tabroom paradigms…", color=EMBED_COLOR))
-                for j in session.unmatched:
-                    session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
-                await loading.delete()
-            judge = session.unmatched[0]
-            total = len(session.unmatched)
-            # Build compact info embed (paradigm shown separately)
-            embed = discord.Embed(title=f"Judge 1/{total} — {judge['name']}", color=EMBED_COLOR)
-            embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
-            embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
-            url = tabroom_paradigm_url(judge["name"])
-            embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
-            embed.set_footer(text=f"Progress: 1/{total}")
-            view = ScoringView(session)
-            rm = session.rating_max
-            intro = discord.Embed(
-                title="🎯 Direct Rating",
-                description=f"**{total}** judges need scores.\n"
-                            f"Use the buttons below to score each judge (1–{rm}).\n"
-                            f"• **1** = Best  • **{rm}** = Worst  • **{rm + 1}** = Strike\n"
-                            "• Use **Compare** to view two judges side-by-side\n"
-                            "• Use **Previous** to go back and change a score",
-                color=EMBED_COLOR)
-            await channel.send(embed=intro)
-            await channel.send(embed=embed, view=view)
-            # Show paradigm as separate message
-            para_embed = _build_paradigm_embed(judge, session)
-            await _update_paradigms(channel, session, [para_embed])
-
-        elif text == "2" or "compare" in text.lower():
-            if tabroom_scraper and tabroom_cache:
-                loading = await channel.send(embed=discord.Embed(
-                    description="🌐 Fetching Tabroom paradigms…", color=EMBED_COLOR))
-                for j in session.unmatched:
-                    session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
-                await loading.delete()
-            anchors = _select_anchors(session.matched)
-            # Override anchor scores with pre-filled CSV ratings
-            for anchor in anchors:
-                prefilled = session.scores_map.get(anchor["name"])
-                if prefilled is not None:
-                    anchor["score"] = prefilled
-            # Add pre-filled unmatched judges as additional anchors
-            for j in session.prefilled_unmatched:
-                score = session.scores_map.get(j["name"])
-                if score is not None and score < 6.0:
-                    anchors.append({"name": j["name"], "school": j["school"],
-                                    "rounds": j["rounds"], "score": score})
-            session.ranker = PairwiseRanker(session.unmatched, anchors)
-            session.state = "comparing"
-            intro = discord.Embed(
-                title="🔀 Pairwise Comparison Mode",
-                description=f"**{session.ranker.total_comparisons}** matchups to rank "
-                            f"**{len(session.unmatched)}** unknown judges.\n"
-                            "Pick the better judge using the buttons below.\n"
-                            "Press **✅ Done** to finish early.",
-                color=EMBED_COLOR)
-            await channel.send(embed=intro)
-            info_embeds, para_embeds = _build_comparison_embeds(session)
-            view = PairwiseView(session)
-            await channel.send(embeds=info_embeds, view=view)
-            await _update_paradigms(channel, session, para_embeds)
-
-        elif text == "3" or "skip" in text.lower():
-            session.skipped_judges = list(session.unmatched)
-            await channel.send(embed=discord.Embed(
-                description=f"⏭️ Skipping {len(session.unmatched)} unmatched judge(s) — they'll have empty ratings.",
-                color=EMBED_COLOR))
-            session.state = "awaiting_quota_mode"
-            await send_quota_mode_prompt(channel, session)
-
-        else:
-            await channel.send(embed=discord.Embed(
-                description="Please enter **1** (rate), **2** (skip), or **3** (compare):", color=WARN_COLOR))
+        await channel.send(embed=discord.Embed(
+            description="Please use the buttons above to choose how to handle unmatched judges.",
+            color=WARN_COLOR))
 
     # --- Pairwise comparing (text fallback) ---
     elif session.state == "comparing":
@@ -1335,29 +1208,199 @@ async def _apply_rating_range(channel, session: PrefSession, max_val: int):
                      f"(treated as anchors).")
         await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
         session.state = "awaiting_source_choice"
-        await _send_source_choice(channel)
+        await _send_source_choice(channel, session)
 
 
-async def _send_source_choice(channel):
+class SourceChoiceView(ui.View):
+    """Buttons for choosing rating source: Notion or from scratch."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="Notion Database", style=discord.ButtonStyle.primary, emoji="📚")
+    async def notion(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "notion")
+
+    @ui.button(label="From Scratch", style=discord.ButtonStyle.secondary, emoji="📝")
+    async def scratch(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "scratch")
+
+    async def _handle(self, interaction: discord.Interaction, choice: str):
+        session = self.session
+        channel = interaction.channel
+        self.stop()
+
+        if choice == "notion":
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="🔍 Fetching absolute scores from Notion…",
+                                    color=EMBED_COLOR), view=None)
+            session.notion_judges = fetch_notion_judges()
+            session.matched, all_unmatched = match_judges(session.csv_judges, session.notion_judges)
+            session.prefilled_unmatched = [j for j in all_unmatched if j["name"] in session.scores_map]
+            session.unmatched = [j for j in all_unmatched if j["name"] not in session.scores_map]
+            summary = discord.Embed(title="📊 Match Results", color=EMBED_COLOR)
+            summary.add_field(name="✅ Matched", value=str(len(session.matched)), inline=True)
+            if session.prefilled_unmatched:
+                summary.add_field(name="📋 Pre-filled",
+                                  value=str(len(session.prefilled_unmatched)), inline=True)
+            summary.add_field(name="❓ Unmatched", value=str(len(session.unmatched)), inline=True)
+            summary.add_field(name="📚 Notion DB", value=str(len(session.notion_judges)), inline=True)
+            await channel.send(embed=summary)
+            if session.unmatched:
+                session.state = "awaiting_unmatched_choice"
+                await _send_unmatched_prompt(channel, session)
+            else:
+                session.state = "awaiting_quota_mode"
+                await send_quota_mode_prompt(channel, session)
+
+        else:  # scratch
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="📝 Ranking from scratch…", color=EMBED_COLOR),
+                view=None)
+            session.notion_judges = []
+            session.matched = []
+            all_judges = list(session.csv_judges)
+            session.prefilled_unmatched = [j for j in all_judges if j["name"] in session.scores_map]
+            session.unmatched = [j for j in all_judges if j["name"] not in session.scores_map]
+            if not session.unmatched:
+                await channel.send(embed=discord.Embed(
+                    description="📋 All judges already have pre-filled ratings. "
+                                "Proceeding to quota setup…",
+                    color=SUCCESS_COLOR))
+                session.state = "awaiting_quota_mode"
+                await send_quota_mode_prompt(channel, session)
+            else:
+                desc = f"📝 Ranking from scratch — **{len(session.unmatched)}** judges to rate."
+                if session.prefilled_unmatched:
+                    desc += (f"\n📋 **{len(session.prefilled_unmatched)}** judge(s) have "
+                             f"pre-filled ratings (anchors).")
+                await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+                session.state = "awaiting_unmatched_choice"
+                await _send_unmatched_prompt(channel, session)
+
+
+class UnmatchedChoiceView(ui.View):
+    """Buttons for choosing how to handle unmatched judges."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="Direct Rating", style=discord.ButtonStyle.primary, emoji="🎯")
+    async def direct_rate(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "rate")
+
+    @ui.button(label="Pairwise Compare", style=discord.ButtonStyle.primary, emoji="🔀")
+    async def pairwise(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "compare")
+
+    @ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭️")
+    async def skip(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "skip")
+
+    async def _handle(self, interaction: discord.Interaction, choice: str):
+        session = self.session
+        channel = interaction.channel
+        self.stop()
+
+        if choice == "rate":
+            session.state = "prompting_scores"
+            session.current_idx = 0
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="🎯 Starting direct rating…", color=EMBED_COLOR),
+                view=None)
+            if tabroom_scraper and tabroom_cache:
+                loading = await channel.send(embed=discord.Embed(
+                    description="🌐 Fetching Tabroom paradigms…", color=EMBED_COLOR))
+                for j in session.unmatched:
+                    session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
+                await loading.delete()
+            judge = session.unmatched[0]
+            total = len(session.unmatched)
+            embed = discord.Embed(title=f"Judge 1/{total} — {judge['name']}", color=EMBED_COLOR)
+            embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
+            embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
+            url = tabroom_paradigm_url(judge["name"])
+            embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
+            embed.set_footer(text=f"Progress: 1/{total}")
+            view = ScoringView(session)
+            rm = session.rating_max
+            intro = discord.Embed(
+                title="🎯 Direct Rating",
+                description=f"**{total}** judges need scores.\n"
+                            f"Use the buttons below to score each judge (1–{rm}).\n"
+                            f"• **1** = Best  • **{rm}** = Worst  • Strike/Conflict\n"
+                            "• Use **Compare** to view two judges side-by-side\n"
+                            "• Use **Previous** to go back and change a score",
+                color=EMBED_COLOR)
+            await channel.send(embed=intro)
+            await channel.send(embed=embed, view=view)
+            para_embed = _build_paradigm_embed(judge, session)
+            await _update_paradigms(channel, session, [para_embed])
+
+        elif choice == "compare":
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="🔀 Starting pairwise comparison…", color=EMBED_COLOR),
+                view=None)
+            if tabroom_scraper and tabroom_cache:
+                loading = await channel.send(embed=discord.Embed(
+                    description="🌐 Fetching Tabroom paradigms…", color=EMBED_COLOR))
+                for j in session.unmatched:
+                    session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
+                await loading.delete()
+            anchors = _select_anchors(session.matched)
+            for anchor in anchors:
+                prefilled = session.scores_map.get(anchor["name"])
+                if prefilled is not None:
+                    anchor["score"] = prefilled
+            for j in session.prefilled_unmatched:
+                score = session.scores_map.get(j["name"])
+                if score is not None and score < 6.0:
+                    anchors.append({"name": j["name"], "school": j["school"],
+                                    "rounds": j["rounds"], "score": score})
+            session.ranker = PairwiseRanker(session.unmatched, anchors)
+            session.state = "comparing"
+            intro = discord.Embed(
+                title="🔀 Pairwise Comparison Mode",
+                description=f"**{session.ranker.total_comparisons}** matchups to rank "
+                            f"**{len(session.unmatched)}** unknown judges.\n"
+                            "Pick the better judge using the buttons below.\n"
+                            "Press **✅ Done** to finish early.",
+                color=EMBED_COLOR)
+            await channel.send(embed=intro)
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            view = PairwiseView(session)
+            await channel.send(embeds=info_embeds, view=view)
+            await _update_paradigms(channel, session, para_embeds)
+
+        else:  # skip
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    description=f"⏭️ Skipping {len(session.unmatched)} unmatched judge(s) — "
+                                "they'll have empty ratings.",
+                    color=EMBED_COLOR), view=None)
+            session.skipped_judges = list(session.unmatched)
+            session.state = "awaiting_quota_mode"
+            await send_quota_mode_prompt(channel, session)
+
+
+async def _send_source_choice(channel, session: PrefSession):
     """Prompt user to choose between Notion database or ranking from scratch."""
-    await channel.send(embed=discord.Embed(
+    embed = discord.Embed(
         title="📚 Rating Source",
-        description="How would you like to rate judges?\n\n"
-                    "**1.** Use Notion database (match judges to existing rankings)\n"
-                    "**2.** Rank from scratch (rate all judges fresh)\n\n"
-                    "Enter **1** or **2**:",
-        color=EMBED_COLOR))
+        description="How would you like to rate judges?",
+        color=EMBED_COLOR)
+    view = SourceChoiceView(session)
+    await channel.send(embed=embed, view=view)
 
 
 async def _send_unmatched_prompt(channel, session: PrefSession):
-    await channel.send(embed=discord.Embed(
+    embed = discord.Embed(
         title="❓ Unmatched Judges",
-        description=f"**{len(session.unmatched)}** judge(s) not found in the database.\n\n"
-                    "**1.** Direct rating (interactive buttons)\n"
-                    "**2.** Pairwise compare\n"
-                    "**3.** Skip — leave their ratings empty\n\n"
-                    "Enter **1**, **2**, or **3**:",
-        color=WARN_COLOR))
+        description=f"**{len(session.unmatched)}** judge(s) not found in the database.\n"
+                    "How would you like to handle them?",
+        color=WARN_COLOR)
+    view = UnmatchedChoiceView(session)
+    await channel.send(embed=embed, view=view)
 
 
 async def send_quota_mode_prompt(channel, session: PrefSession, interaction=None):
