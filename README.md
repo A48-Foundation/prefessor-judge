@@ -7,18 +7,20 @@ A tournament judge preference sheet generator for the A48 debate program. Built 
 Prefessor Judge has three components:
 
 1. **Absolute Ranking Database** — Takes CSV input of judges and rankings from past tournaments, stores absolute scores in a Notion database.
-2. **Pref Calculator** — Given a list of judges for an upcoming tournament and tier quotas, algorithmically assigns optimal tier rankings (1–5, Strike, Conflict) that satisfy round/judge count requirements.
-3. **Discord Bot UI** — Users interact with Prefessor Judge through Discord: upload a CSV, score unknown judges with Tabroom paradigm data, review/edit scores, set quotas, and receive a filled pref sheet.
+2. **Pref Calculator** — Given a list of judges for an upcoming tournament and tier quotas, algorithmically assigns optimal tier rankings that satisfy round/judge count requirements. Supports configurable rating scales (1–5, 1–6, 1–7, etc.).
+3. **Discord Bot UI** — Users interact with Prefessor Judge through Discord: upload a CSV, choose a rating scale, score unknown judges with Tabroom paradigm data, review/edit scores, set quotas, and receive a filled pref sheet.
 
 ## How It Works
 
 ### Rating Modes
 
-After uploading a tournament CSV, users choose between two sources:
+After uploading a tournament CSV, users select a **rating scale** (e.g. 1–5, 1–6, 1–7) via buttons. If the CSV already has pre-filled ratings, those are treated as anchors — judges with existing scores skip manual scoring. If all judges are pre-filled, the bot jumps directly to quota setup.
+
+Users then choose between two sources:
 
 1. **Notion Database** — Matches CSV judges to existing rankings in the Notion database. Only unmatched (new) judges need to be rated.
-2. **Rank from Scratch** — All judges start unrated. Choose from:
-   - **Manual Rating** — View each judge's Tabroom paradigm and assign a score (1–7) via buttons.
+2. **From Scratch** — All judges start unrated. Choose from:
+   - **Direct Rating** — View each judge's Tabroom paradigm and assign a score via buttons (1–N, Strike, Conflict).
    - **Pairwise Comparison** — An Elo-based system that presents judges in pairs; pick the better one.
 
 ### Pairwise Comparison (Elo + Adaptive Swiss)
@@ -121,7 +123,10 @@ The tier assignment algorithm is designed to maximize the probability of getting
 
 ### Interactive Discord Bot
 - **Rich embeds** — All messages use Discord embeds with color-coded status indicators
-- **Button-based scoring** — Score judges 1–7 with a single click instead of typing numbers
+- **Button-based UI** — Rating scale, source choice, unmatched handling, and quota mode all use interactive buttons (no typing required)
+- **Button-based scoring** — Score judges 1–N with a single click, plus Strike and Conflict buttons
+- **Configurable rating scale** — Choose 1–5, 1–6, 1–7, or any custom max via buttons or text input
+- **Pre-filled CSV support** — Existing ratings in the CSV are honored as anchors; fully pre-filled sheets skip to quotas
 - **Navigation controls** — Previous / Next / Skip buttons to move between judges
 - **Judge comparison** — Side-by-side paradigm comparison using the 🔍 Compare button
 - **Pairwise comparison** — Elo-based ranking with adaptive Swiss pairing and direct rating dropdowns
@@ -154,8 +159,10 @@ prefessor-judge/
 │   ├── notion_reader.py        # Fetch absolute scores from Notion
 │   ├── pairwise_ranker.py      # Elo + adaptive Swiss pairwise ranking
 │   ├── tier_assigner.py        # Core tier assignment algorithm
-│   ├── tabroom_scraper.py      # Tabroom.com paradigm scraper
+│   ├── judge_scraper.py        # Tabroom.com paradigm scraper
+│   ├── tabroom_auth.py         # Tabroom.com authentication client
 │   ├── tabroom_cache.py        # In-memory cache for paradigm data
+│   ├── README.md               # Algorithm deep-dive documentation
 │   └── requirements.txt        # Python dependencies
 ├── Procfile                    # Railway deployment
 ├── railway.toml                # Railway config
@@ -215,14 +222,15 @@ The bot is configured for Railway deployment:
 
 1. **Start a session** — Mention the bot: `@Prefessor Judge do prefs`
 2. **Upload CSV** — Attach a tournament judge CSV file (columns: `Name, School, Rounds, Your Rating` or `First, Last, School, Online, Rounds, Rating`)
-3. **Choose rating source** — Use Notion database or rank from scratch
-4. **Rate judges** — For unmatched/all judges:
-   - **Manual**: View each judge's Tabroom paradigm, click a score button (1–7)
-   - **Pairwise**: Pick the better judge in each pair, or rate directly via dropdown
+3. **Select rating scale** — Choose the tournament's max rating (1–5, 1–6, 1–7) via buttons
+4. **Choose rating source** — Use Notion database or rank from scratch (buttons)
+5. **Rate judges** — For unmatched/all judges (buttons):
+   - **Direct Rating**: View each judge's Tabroom paradigm, click a score button (1–N, Strike, Conflict)
+   - **Pairwise Compare**: Pick the better judge in each pair, or rate directly via dropdown
    - **Skip**: Leave unmatched judges with default ratings
-5. **Review scores** — See a summary of all scored judges; use the dropdown to edit any score
-6. **Set quotas** — Choose quota mode (rounds or judges), then enter min/max for each tier
-7. **Get results** — Receive a tier assignment report and the filled CSV file
+6. **Review scores** — See a summary of all scored judges; use the dropdown to edit any score
+7. **Set quotas** — Choose quota mode (rounds or judges), then enter min/max for each tier
+8. **Get results** — Receive a tier assignment report and the filled CSV file (C for conflict, S for strike)
 
 Type `cancel` to abort or `resume` to refresh buttons if they stop responding.
 
@@ -239,6 +247,15 @@ Type `cancel` to abort or `resume` to refresh buttons if they stop responding.
 | 7 | C | Conflict (same school as our program) |
 
 ## Changelog
+
+### v4 — Configurable Rating Scale & Button UI (2026-03-07)
+- **Configurable rating scale** — Choose 1–5, 1–6, 1–7, or custom max; all scores normalized to internal 1–5 scale
+- **Pre-filled CSV support** — Existing ratings (numbers, S, C) honored as anchors; fully pre-filled sheets skip to quotas
+- **Button-based prompts** — Rating source, unmatched choice, and rating scale all use interactive buttons (no typing)
+- **Conflict support everywhere** — Conflict buttons in pairwise, direct rating, dropdowns, and re-score modal
+- **Output labels** — CSV output uses `C` for conflict and `S` for strike
+- **Scraper refactor** — `tabroom_scraper.py` split into `judge_scraper.py` + `tabroom_auth.py`
+- **Message deduplication** — Button callbacks edit original messages instead of sending duplicates
 
 ### v3 — Adaptive Pairwise & Guaranteed Quotas (2026-03-05)
 - **Rank from scratch** mode — rate all judges fresh without Notion data
