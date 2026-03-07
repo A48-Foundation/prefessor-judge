@@ -291,11 +291,7 @@ class RatingRangeView(ui.View):
 
     async def _set_range(self, interaction: discord.Interaction, max_val: int):
         self.stop()
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                description=f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})",
-                color=EMBED_COLOR), view=None)
-        await _apply_rating_range(interaction.channel, self.session, max_val)
+        await _apply_rating_range(interaction, self.session, max_val)
 
 
 # ---------------------------------------------------------------------------
@@ -1185,8 +1181,12 @@ async def _send_rating_range_prompt(channel, session: PrefSession):
     await channel.send(embed=embed, view=RatingRangeView(session))
 
 
-async def _apply_rating_range(channel, session: PrefSession, max_val: int):
-    """Apply the selected rating range and proceed with pre-filled processing."""
+async def _apply_rating_range(interaction_or_channel, session: PrefSession, max_val: int):
+    """Apply the selected rating range and proceed with pre-filled processing.
+
+    interaction_or_channel: a discord.Interaction (from button) or a channel (from text input).
+    If an Interaction, edits the original message; otherwise sends a new one.
+    """
     session.rating_max = max_val
     prefilled_count = _process_csv_prefilled(session)
     total = len(session.csv_judges)
@@ -1195,18 +1195,30 @@ async def _apply_rating_range(channel, session: PrefSession, max_val: int):
         session.matched = []
         session.unmatched = list(session.csv_judges)
         session.state = "awaiting_quota_mode"
-        await channel.send(embed=discord.Embed(
+        result_embed = discord.Embed(
             description=f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})\n"
                         f"📋 All **{total}** judges have pre-filled ratings. "
                         f"Proceeding to quota setup…",
-            color=SUCCESS_COLOR))
+            color=SUCCESS_COLOR)
+        if isinstance(interaction_or_channel, discord.Interaction):
+            await interaction_or_channel.response.edit_message(embed=result_embed, view=None)
+            channel = interaction_or_channel.channel
+        else:
+            channel = interaction_or_channel
+            await channel.send(embed=result_embed)
         await send_quota_mode_prompt(channel, session)
     else:
         desc = f"📏 Rating range: **1–{max_val}** (strike = {max_val + 1})"
         if prefilled_count > 0:
             desc += (f"\n📋 **{prefilled_count}** judge(s) have pre-filled ratings "
                      f"(treated as anchors).")
-        await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+        result_embed = discord.Embed(description=desc, color=EMBED_COLOR)
+        if isinstance(interaction_or_channel, discord.Interaction):
+            await interaction_or_channel.response.edit_message(embed=result_embed, view=None)
+            channel = interaction_or_channel.channel
+        else:
+            channel = interaction_or_channel
+            await channel.send(embed=result_embed)
         session.state = "awaiting_source_choice"
         await _send_source_choice(channel, session)
 
@@ -1245,7 +1257,8 @@ class SourceChoiceView(ui.View):
                                   value=str(len(session.prefilled_unmatched)), inline=True)
             summary.add_field(name="❓ Unmatched", value=str(len(session.unmatched)), inline=True)
             summary.add_field(name="📚 Notion DB", value=str(len(session.notion_judges)), inline=True)
-            await channel.send(embed=summary)
+            # Edit the loading message to show results
+            await interaction.edit_original_response(embed=summary)
             if session.unmatched:
                 session.state = "awaiting_unmatched_choice"
                 await _send_unmatched_prompt(channel, session)
@@ -1254,19 +1267,17 @@ class SourceChoiceView(ui.View):
                 await send_quota_mode_prompt(channel, session)
 
         else:  # scratch
-            await interaction.response.edit_message(
-                embed=discord.Embed(description="📝 Ranking from scratch…", color=EMBED_COLOR),
-                view=None)
             session.notion_judges = []
             session.matched = []
             all_judges = list(session.csv_judges)
             session.prefilled_unmatched = [j for j in all_judges if j["name"] in session.scores_map]
             session.unmatched = [j for j in all_judges if j["name"] not in session.scores_map]
             if not session.unmatched:
-                await channel.send(embed=discord.Embed(
-                    description="📋 All judges already have pre-filled ratings. "
-                                "Proceeding to quota setup…",
-                    color=SUCCESS_COLOR))
+                await interaction.response.edit_message(
+                    embed=discord.Embed(
+                        description="📋 All judges already have pre-filled ratings. "
+                                    "Proceeding to quota setup…",
+                        color=SUCCESS_COLOR), view=None)
                 session.state = "awaiting_quota_mode"
                 await send_quota_mode_prompt(channel, session)
             else:
@@ -1274,7 +1285,8 @@ class SourceChoiceView(ui.View):
                 if session.prefilled_unmatched:
                     desc += (f"\n📋 **{len(session.prefilled_unmatched)}** judge(s) have "
                              f"pre-filled ratings (anchors).")
-                await channel.send(embed=discord.Embed(description=desc, color=EMBED_COLOR))
+                await interaction.response.edit_message(
+                    embed=discord.Embed(description=desc, color=EMBED_COLOR), view=None)
                 session.state = "awaiting_unmatched_choice"
                 await _send_unmatched_prompt(channel, session)
 
