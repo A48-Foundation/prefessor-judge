@@ -25,6 +25,7 @@ from name_matcher import match_judges
 from tier_assigner import assign_tiers, format_report
 from csv_writer import write_output_csv
 from pairwise_ranker import PairwiseRanker
+from progress_saver import save_progress, load_progress, restore_session
 
 try:
     from judge_scraper import TabroomScraper
@@ -264,6 +265,10 @@ class PrefSession:
         self.ranker: PairwiseRanker | None = None
         self.paradigm_messages: list = []  # messages to delete on next comparison
         self.prefilled_unmatched: list[dict] = []  # pre-rated judges split from unmatched
+        # Ordinal ranking mode
+        self.ordinal_mode: bool = False
+        self.ordinal_rankings: dict[int, list[str]] = {}  # tier → [judge names in order]
+        self.ordinal_refine_tier: int | None = None  # which tier is being refined
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +358,19 @@ class ScoringView(ui.View):
             await self.show_judge(interaction)
         else:
             await self.finish_scoring(interaction)
+
+    @ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, row=2)
+    async def save_button(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.session
+        file_bytes, filename = save_progress(session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="💾 Progress Saved",
+                description="Download this file to resume later.\n"
+                            "Upload it when starting a new session to pick up where you left off.",
+                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
 
     @ui.button(label="🔍 Compare", style=discord.ButtonStyle.primary, row=2)
     async def compare_button(self, interaction: discord.Interaction, button: ui.Button):
@@ -551,6 +569,19 @@ class ReviewView(ui.View):
         self.session.state = "awaiting_quota_mode"
         await send_quota_mode_prompt(interaction.channel, self.session, interaction=interaction)
 
+    @ui.button(label="💾 Save Progress", style=discord.ButtonStyle.secondary, row=2)
+    async def save_review(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.session
+        file_bytes, filename = save_progress(session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="💾 Progress Saved",
+                description="Download this file to resume later.\n"
+                            "Upload it when starting a new session to pick up where you left off.",
+                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
+
 
 # ---------------------------------------------------------------------------
 # Pairwise Comparison Views
@@ -664,6 +695,19 @@ class PairwiseView(ui.View):
         self.stop()
         await interaction.response.edit_message(content="⏳ Finishing comparison…", embeds=[], view=None)
         await _finish_comparison(interaction.channel, self.session)
+
+    @ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, row=1)
+    async def save_progress_btn(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.session
+        file_bytes, filename = save_progress(session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="💾 Progress Saved",
+                description="Download this file to resume later.\n"
+                            "Upload it when starting a new session to pick up where you left off.",
+                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
 
     @ui.button(label="Strike A", style=discord.ButtonStyle.danger, row=1)
     async def strike_a(self, interaction: discord.Interaction, button: ui.Button):
@@ -858,6 +902,655 @@ def _build_paradigm_embed(judge: dict, session: PrefSession, color: int = EMBED_
 
 
 # ---------------------------------------------------------------------------
+# Ordinal Ranking Views
+# ---------------------------------------------------------------------------
+
+class BulkStrikeSelect(ui.Select):
+    """Multi-select dropdown for bulk strike/conflict assignment."""
+    def __init__(self, session: PrefSession, judges: list[dict], action: str, page: int = 0):
+        self.session = session
+        self.action = action  # "strike" or "conflict"
+        self.page = page
+        label = "Strike" if action == "strike" else "Conflict"
+        emoji = "🚫" if action == "strike" else "⚠️"
+        start = page * 25
+        batch = judges[start:start + 25]
+        options = [discord.SelectOption(label=j["name"][:100], value=j["name"][:100],
+                                        description=j.get("school", "")[:100])
+                   for j in batch]
+        super().__init__(placeholder=f"Select judges to {label}… (page {page + 1})",
+                         options=options, min_values=0, max_values=len(options))
+
+    async def callback(self, interaction: discord.Interaction):
+        score = 6.0 if self.action == "strike" else 7.0
+        for name in self.values:
+            self.session.scores_map[name] = score
+        label = "struck" if self.action == "strike" else "conflicted"
+        count = len(self.values)
+        if count > 0:
+            await interaction.response.send_message(
+                f"✅ **{count}** judge(s) marked as {label}.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No judges selected.", ephemeral=True)
+
+
+class BulkStrikeView(ui.View):
+    """View for bulk strike/conflict selection before ordinal bucketing."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+        # Get judges not yet struck/conflicted
+        available = [j for j in session.unmatched
+                     if session.scores_map.get(j["name"], 0) < 6.0]
+        # Add paginated strike selects (max 25 options per select, max 4 selects)
+        pages = (len(available) + 24) // 25
+        for page in range(min(pages, 2)):
+            self.add_item(BulkStrikeSelect(session, available, "strike", page))
+        # Conflict gets its own select if space permits
+        if pages <= 2:
+            for page in range(min(pages, 1)):
+                self.add_item(BulkStrikeSelect(session, available, "conflict", page))
+
+    @ui.button(label="✅ Done — Start Bucketing", style=discord.ButtonStyle.success, row=4)
+    async def done(self, interaction: discord.Interaction, button: ui.Button):
+        self.stop()
+        session = self.session
+        # Remove struck/conflicted judges from the bucketing pool
+        struck = [n for n, s in session.scores_map.items() if s >= 6.0]
+        session.unmatched = [j for j in session.unmatched
+                             if session.scores_map.get(j["name"], 0) < 6.0]
+        count = len(struck)
+        desc = f"🚫 **{count}** judge(s) struck/conflicted." if count else "No strikes or conflicts."
+        desc += f"\n📊 **{len(session.unmatched)}** judges to bucket into tiers."
+        await interaction.response.edit_message(
+            embed=discord.Embed(description=desc, color=EMBED_COLOR), view=None)
+        session.state = "ordinal_bucketing"
+        session.current_idx = 0
+        await _send_ordinal_bucket(interaction.channel, session)
+
+    @ui.button(label="⏭ Skip — No Strikes", style=discord.ButtonStyle.secondary, row=4)
+    async def skip(self, interaction: discord.Interaction, button: ui.Button):
+        self.stop()
+        session = self.session
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                description=f"📊 **{len(session.unmatched)}** judges to bucket into tiers.",
+                color=EMBED_COLOR), view=None)
+        session.state = "ordinal_bucketing"
+        session.current_idx = 0
+        await _send_ordinal_bucket(interaction.channel, session)
+
+
+class OrdinalBucketView(ui.View):
+    """Fast one-tap tier assignment for each judge."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="1 Best", style=discord.ButtonStyle.success, row=0)
+    async def tier1(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 1.0)
+
+    @ui.button(label="2 Good", style=discord.ButtonStyle.success, row=0)
+    async def tier2(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 2.0)
+
+    @ui.button(label="3 Mid", style=discord.ButtonStyle.primary, row=0)
+    async def tier3(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 3.0)
+
+    @ui.button(label="4 Bad", style=discord.ButtonStyle.secondary, row=0)
+    async def tier4(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 4.0)
+
+    @ui.button(label="5 Worst", style=discord.ButtonStyle.secondary, row=0)
+    async def tier5(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 5.0)
+
+    @ui.button(label="Strike", style=discord.ButtonStyle.danger, row=1)
+    async def strike(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 6.0)
+
+    @ui.button(label="Conflict", style=discord.ButtonStyle.secondary, row=1)
+    async def conflict(self, interaction: discord.Interaction, button: ui.Button):
+        await self._assign(interaction, 7.0)
+
+    @ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary, row=1)
+    async def prev(self, interaction: discord.Interaction, button: ui.Button):
+        if self.session.current_idx > 0:
+            self.session.current_idx -= 1
+        await _show_ordinal_bucket_judge(interaction, self.session, self)
+
+    @ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, row=1)
+    async def save_btn(self, interaction: discord.Interaction, button: ui.Button):
+        file_bytes, filename = save_progress(self.session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(title="💾 Progress Saved",
+                                description="Download to resume later.",
+                                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
+
+    @ui.button(label="🔍 Compare", style=discord.ButtonStyle.primary, row=1)
+    async def compare_btn(self, interaction: discord.Interaction, button: ui.Button):
+        current_judge = self.session.unmatched[self.session.current_idx]
+        all_names = [j["name"] for j in self.session.csv_judges if j["name"] != current_judge["name"]]
+        options = [discord.SelectOption(label=n[:100], value=n[:100]) for n in all_names[:25]]
+        if not options:
+            await interaction.response.send_message("No other judges to compare.", ephemeral=True)
+            return
+        view = OrdinalCompareSelectView(self.session, current_judge, options, parent_view=self)
+        await interaction.response.send_message("Pick a judge to compare with:", view=view, ephemeral=True)
+
+    async def _assign(self, interaction: discord.Interaction, score: float):
+        session = self.session
+        judge = session.unmatched[session.current_idx]
+        session.scores_map[judge["name"]] = score
+        session.current_idx += 1
+        if session.current_idx < len(session.unmatched):
+            await _show_ordinal_bucket_judge(interaction, session, self)
+        else:
+            self.stop()
+            await _finish_ordinal_bucketing(interaction, session)
+
+
+class OrdinalCompareSelectView(ui.View):
+    """Select a judge to compare side-by-side during ordinal bucketing."""
+    def __init__(self, session: PrefSession, current_judge: dict,
+                 options: list[discord.SelectOption], parent_view: OrdinalBucketView):
+        super().__init__(timeout=None)
+        self.session = session
+        self.current_judge = current_judge
+        self.parent_view = parent_view
+        select = ui.Select(placeholder="Select a judge to compare…", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        selected_name = interaction.data["values"][0]
+        other = next((j for j in self.session.csv_judges if j["name"] == selected_name), None)
+        if not other:
+            await interaction.response.send_message("Judge not found.", ephemeral=True)
+            return
+        score1 = self.session.scores_map.get(self.current_judge["name"])
+        score2 = self.session.scores_map.get(other["name"])
+        p1 = self.session.paradigms.get(self.current_judge["name"])
+        p2 = self.session.paradigms.get(other["name"])
+        embed1 = build_judge_embed(self.current_judge, p1, score=score1)
+        embed1.title = f"🅰️ {self.current_judge['name']}"
+        embed2 = build_judge_embed(other, p2, score=score2)
+        embed2.title = f"🅱️ {other['name']}"
+        await interaction.response.edit_message(
+            content="**Side-by-side comparison:**", embeds=[embed1, embed2], view=None)
+
+
+class OrdinalRefinePromptView(ui.View):
+    """Show tier summary and let user pick which tier to refine via pairwise."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="Refine Tier 1", style=discord.ButtonStyle.success, row=0)
+    async def refine_1(self, interaction: discord.Interaction, button: ui.Button):
+        await self._refine(interaction, 1)
+
+    @ui.button(label="Refine Tier 2", style=discord.ButtonStyle.success, row=0)
+    async def refine_2(self, interaction: discord.Interaction, button: ui.Button):
+        await self._refine(interaction, 2)
+
+    @ui.button(label="Refine Tier 3", style=discord.ButtonStyle.primary, row=0)
+    async def refine_3(self, interaction: discord.Interaction, button: ui.Button):
+        await self._refine(interaction, 3)
+
+    @ui.button(label="Refine Tier 4", style=discord.ButtonStyle.secondary, row=0)
+    async def refine_4(self, interaction: discord.Interaction, button: ui.Button):
+        await self._refine(interaction, 4)
+
+    @ui.button(label="Refine Tier 5", style=discord.ButtonStyle.secondary, row=0)
+    async def refine_5(self, interaction: discord.Interaction, button: ui.Button):
+        await self._refine(interaction, 5)
+
+    @ui.button(label="✅ Finish — Export Rankings", style=discord.ButtonStyle.success, row=1)
+    async def finish(self, interaction: discord.Interaction, button: ui.Button):
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="⏳ Building export…", color=EMBED_COLOR), view=None)
+        await _export_ordinal_rankings(interaction.channel, self.session)
+
+    @ui.button(label="💾 Save Progress", style=discord.ButtonStyle.secondary, row=1)
+    async def save_btn(self, interaction: discord.Interaction, button: ui.Button):
+        file_bytes, filename = save_progress(self.session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(title="💾 Progress Saved",
+                                description="Download to resume later.",
+                                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
+
+    async def _refine(self, interaction: discord.Interaction, tier: int):
+        session = self.session
+        tier_judges = [j for j in session.csv_judges
+                       if session.scores_map.get(j["name"]) == float(tier)]
+        if len(tier_judges) < 2:
+            await interaction.response.send_message(
+                f"Tier {tier} has {len(tier_judges)} judge(s) — nothing to refine.", ephemeral=True)
+            return
+        # Check if already refined
+        if tier in session.ordinal_rankings and session.ordinal_rankings[tier]:
+            await interaction.response.send_message(
+                f"Tier {tier} already refined ({len(session.ordinal_rankings[tier])} judges). "
+                "Press **Finish** to export or refine a different tier.", ephemeral=True)
+            return
+        self.stop()
+        session.ordinal_refine_tier = tier
+        session.state = "ordinal_refining"
+        # Build pairwise ranker for just this tier
+        session.ranker = PairwiseRanker(tier_judges, anchor_judges=[])
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                description=f"🔀 Refining **Tier {tier}** — "
+                            f"**{session.ranker.total_comparisons}** matchups for "
+                            f"**{len(tier_judges)}** judges.",
+                color=EMBED_COLOR), view=None)
+        info_embeds, para_embeds = _build_comparison_embeds(session)
+        view = OrdinalPairwiseView(session)
+        await interaction.channel.send(embeds=info_embeds, view=view)
+        await _update_paradigms(interaction.channel, session, para_embeds)
+
+
+class OrdinalPairwiseView(ui.View):
+    """Pairwise comparison view for within-tier ordinal refinement."""
+    def __init__(self, session: PrefSession):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @ui.button(label="A", style=discord.ButtonStyle.primary, row=0)
+    async def pick_a(self, interaction: discord.Interaction, button: ui.Button):
+        await self._record(interaction, "a")
+
+    @ui.button(label="B", style=discord.ButtonStyle.success, row=0)
+    async def pick_b(self, interaction: discord.Interaction, button: ui.Button):
+        await self._record(interaction, "b")
+
+    @ui.button(label="Skip", style=discord.ButtonStyle.secondary, row=0)
+    async def skip(self, interaction: discord.Interaction, button: ui.Button):
+        await self._record(interaction, "skip")
+
+    @ui.button(label="Undo", style=discord.ButtonStyle.secondary, row=0)
+    async def undo(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.session
+        if not session.ranker:
+            return
+        if session.ranker.undo():
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            await interaction.response.edit_message(content="↩️ Undone.", embeds=info_embeds, view=self)
+            await _update_paradigms(interaction.channel, session, para_embeds)
+        else:
+            await interaction.response.edit_message(content="Nothing to undo.")
+
+    @ui.button(label="Done", style=discord.ButtonStyle.secondary, row=0)
+    async def done(self, interaction: discord.Interaction, button: ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Finishing tier refinement…",
+                                                embeds=[], view=None)
+        await _finish_ordinal_tier_refine(interaction.channel, self.session)
+
+    @ui.button(label="💾 Save", style=discord.ButtonStyle.secondary, row=1)
+    async def save_btn(self, interaction: discord.Interaction, button: ui.Button):
+        file_bytes, filename = save_progress(self.session)
+        file = discord.File(io.BytesIO(file_bytes), filename=filename)
+        await interaction.response.send_message(
+            embed=discord.Embed(title="💾 Progress Saved",
+                                description="Download to resume later.",
+                                color=SUCCESS_COLOR),
+            file=file, ephemeral=True)
+
+    async def _record(self, interaction: discord.Interaction, choice: str):
+        session = self.session
+        if not session.ranker:
+            return
+        pair = session.ranker.next_pair()
+        if not pair:
+            self.stop()
+            await interaction.response.edit_message(content="⏳ Finishing tier refinement…",
+                                                    embeds=[], view=None)
+            await _finish_ordinal_tier_refine(interaction.channel, session)
+            return
+        judge_a, judge_b = pair
+        if choice == "a":
+            session.ranker.record_result(judge_a, judge_b)
+        elif choice == "b":
+            session.ranker.record_result(judge_b, judge_a)
+        else:
+            session.ranker.skip_pair()
+        if session.ranker.is_complete:
+            self.stop()
+            await interaction.response.edit_message(content="⏳ Finishing tier refinement…",
+                                                    embeds=[], view=None)
+            await _finish_ordinal_tier_refine(interaction.channel, session)
+        else:
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            await interaction.response.edit_message(content=None, embeds=info_embeds, view=self)
+            await _update_paradigms(interaction.channel, session, para_embeds)
+
+
+# --- Ordinal helper functions ---
+
+async def _send_ordinal_bulk_strike(channel, session: PrefSession):
+    """Send the bulk strike/conflict selection view."""
+    total = len(session.unmatched)
+    embed = discord.Embed(
+        title="🚫 Bulk Strike / Conflict",
+        description=f"**{total}** judges in the pool.\n"
+                    "Select any judges you want to **strike** or **conflict** in bulk.\n"
+                    "Then press **Done** to start tier bucketing.\n\n"
+                    "*You can also skip this step if you have no strikes.*",
+        color=EMBED_COLOR)
+    view = BulkStrikeView(session)
+    await channel.send(embed=embed, view=view)
+
+
+async def _send_ordinal_bucket(channel, session: PrefSession):
+    """Send the bucketing view for the current judge."""
+    if session.current_idx >= len(session.unmatched):
+        await _finish_ordinal_bucketing_from_channel(channel, session)
+        return
+    judge = session.unmatched[session.current_idx]
+    idx = session.current_idx + 1
+    total = len(session.unmatched)
+    existing = session.scores_map.get(judge["name"])
+
+    embed = discord.Embed(title=f"Judge {idx}/{total} — {judge['name']}", color=EMBED_COLOR)
+    embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
+    embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
+    if existing is not None and existing < 6.0:
+        embed.add_field(name="📋 Current Tier", value=str(int(existing)), inline=True)
+    url = tabroom_paradigm_url(judge["name"])
+    embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
+
+    # Show tier distribution so far
+    tier_counts = {}
+    for name, score in session.scores_map.items():
+        if score < 6.0:
+            t = int(score)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+    dist_parts = [f"T{t}: {c}" for t, c in sorted(tier_counts.items())]
+    strikes = sum(1 for s in session.scores_map.values() if s == 6.0)
+    conflicts = sum(1 for s in session.scores_map.values() if s == 7.0)
+    footer = f"Progress: {idx}/{total}"
+    if dist_parts:
+        footer += " • " + " | ".join(dist_parts)
+    if strikes:
+        footer += f" | 🚫{strikes}"
+    if conflicts:
+        footer += f" | ⚠️{conflicts}"
+    embed.set_footer(text=footer)
+
+    view = OrdinalBucketView(session)
+    await channel.send(embed=embed, view=view)
+    para_embed = _build_paradigm_embed(judge, session)
+    await _update_paradigms(channel, session, [para_embed])
+
+
+async def _show_ordinal_bucket_judge(interaction: discord.Interaction,
+                                     session: PrefSession, view: OrdinalBucketView):
+    """Update the embed for the current judge during bucketing."""
+    judge = session.unmatched[session.current_idx]
+    idx = session.current_idx + 1
+    total = len(session.unmatched)
+    existing = session.scores_map.get(judge["name"])
+
+    embed = discord.Embed(title=f"Judge {idx}/{total} — {judge['name']}", color=EMBED_COLOR)
+    embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
+    embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
+    if existing is not None and existing < 6.0:
+        embed.add_field(name="📋 Current Tier", value=str(int(existing)), inline=True)
+    url = tabroom_paradigm_url(judge["name"])
+    embed.add_field(name="🔗 Tabroom", value=f"[View full paradigm]({url})", inline=False)
+
+    tier_counts = {}
+    for name, score in session.scores_map.items():
+        if score < 6.0:
+            t = int(score)
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+    dist_parts = [f"T{t}: {c}" for t, c in sorted(tier_counts.items())]
+    strikes = sum(1 for s in session.scores_map.values() if s == 6.0)
+    conflicts = sum(1 for s in session.scores_map.values() if s == 7.0)
+    footer = f"Progress: {idx}/{total}"
+    if dist_parts:
+        footer += " • " + " | ".join(dist_parts)
+    if strikes:
+        footer += f" | 🚫{strikes}"
+    if conflicts:
+        footer += f" | ⚠️{conflicts}"
+    embed.set_footer(text=footer)
+
+    await interaction.response.edit_message(embed=embed, view=view)
+    para_embed = _build_paradigm_embed(judge, session)
+    await _update_paradigms(interaction.channel, session, [para_embed])
+
+
+async def _finish_ordinal_bucketing(interaction: discord.Interaction, session: PrefSession):
+    """Transition from bucketing to the refine prompt."""
+    # Clean up paradigm messages
+    for msg in session.paradigm_messages:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    session.paradigm_messages.clear()
+
+    session.state = "ordinal_refine_prompt"
+    embed = _build_ordinal_summary_embed(session)
+    view = OrdinalRefinePromptView(session)
+    await interaction.response.edit_message(embed=embed, view=view)
+
+
+async def _finish_ordinal_bucketing_from_channel(channel, session: PrefSession):
+    """Same as above but sends to channel (for resume path)."""
+    for msg in session.paradigm_messages:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    session.paradigm_messages.clear()
+
+    session.state = "ordinal_refine_prompt"
+    embed = _build_ordinal_summary_embed(session)
+    view = OrdinalRefinePromptView(session)
+    await channel.send(embed=embed, view=view)
+
+
+def _build_ordinal_summary_embed(session: PrefSession) -> discord.Embed:
+    """Build the tier summary embed for the refine prompt."""
+    embed = discord.Embed(
+        title="📊 Tier Summary — Choose Tiers to Refine",
+        description="Select a tier to rank judges within it via pairwise comparison.\n"
+                    "Press **Finish** when you're done to export the final ordinal rankings.",
+        color=SUCCESS_COLOR)
+
+    for tier in range(1, 6):
+        names = [j["name"] for j in session.csv_judges
+                 if session.scores_map.get(j["name"]) == float(tier)]
+        refined = tier in session.ordinal_rankings and session.ordinal_rankings[tier]
+        status = "✅ Refined" if refined else "⬜ Not refined"
+        value = f"**{len(names)}** judges — {status}"
+        if refined:
+            # Show first few ranked names
+            ranked = session.ordinal_rankings[tier]
+            preview = ", ".join(ranked[:5])
+            if len(ranked) > 5:
+                preview += f"… (+{len(ranked) - 5})"
+            value += f"\n{preview}"
+        embed.add_field(name=f"Tier {tier}", value=value, inline=False)
+
+    strikes = sum(1 for s in session.scores_map.values() if s == 6.0)
+    conflicts = sum(1 for s in session.scores_map.values() if s == 7.0)
+    if strikes or conflicts:
+        embed.add_field(name="🚫 Strikes / ⚠️ Conflicts",
+                        value=f"{strikes} strike(s), {conflicts} conflict(s)", inline=False)
+    return embed
+
+
+async def _finish_ordinal_tier_refine(channel, session: PrefSession):
+    """Save pairwise results for the current tier and return to refine prompt."""
+    tier = session.ordinal_refine_tier
+    if session.ranker:
+        rankings = session.ranker.get_rankings()
+        session.ordinal_rankings[tier] = [j["name"] for j, elo in rankings]
+
+        embed = discord.Embed(
+            title=f"✅ Tier {tier} Refined",
+            description=f"**{len(rankings)}** judges ranked within Tier {tier}.",
+            color=SUCCESS_COLOR)
+        lines = []
+        for rank, (j, elo) in enumerate(rankings, 1):
+            lines.append(f"`#{rank}` **{j['name']}** (Elo: {elo:.0f})")
+        text = "\n".join(lines[:20])
+        if len(lines) > 20:
+            text += f"\n… and {len(lines) - 20} more"
+        embed.add_field(name="Rankings", value=text or "None", inline=False)
+        await channel.send(embed=embed)
+
+    session.ranker = None
+    session.ordinal_refine_tier = None
+
+    # Clean up paradigm messages
+    for msg in session.paradigm_messages:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    session.paradigm_messages.clear()
+
+    session.state = "ordinal_refine_prompt"
+    summary = _build_ordinal_summary_embed(session)
+    view = OrdinalRefinePromptView(session)
+    await channel.send(embed=summary, view=view)
+
+
+async def _export_ordinal_rankings(channel, session: PrefSession):
+    """Export final ordinal rankings as a formatted Excel file."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Ordinal Rankings"
+
+    # Styling
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="5865F2", end_color="5865F2", fill_type="solid")
+    tier_colors = {
+        1: PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),  # green
+        2: PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid"),  # light blue
+        3: PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid"),  # yellow
+        4: PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),  # orange
+        5: PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid"),  # red-ish
+        6: PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),  # grey
+        7: PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid"),  # dark grey
+    }
+    thin_border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
+    )
+
+    headers = ["Rank", "Name", "School", "Rounds", "Tier"]
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 25
+    ws.column_dimensions["D"].width = 10
+    ws.column_dimensions["E"].width = 10
+
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = thin_border
+
+    judge_lookup = {j["name"]: j for j in session.csv_judges}
+    row = 2
+    global_rank = 1
+
+    for tier in range(1, 6):
+        tier_names = [j["name"] for j in session.csv_judges
+                      if session.scores_map.get(j["name"]) == float(tier)]
+        if not tier_names:
+            continue
+
+        # Use refined order if available, otherwise alphabetical
+        if tier in session.ordinal_rankings and session.ordinal_rankings[tier]:
+            ordered = session.ordinal_rankings[tier]
+            # Add any tier members not in the refined list (edge case)
+            refined_set = set(ordered)
+            for name in tier_names:
+                if name not in refined_set:
+                    ordered.append(name)
+        else:
+            ordered = sorted(tier_names)
+
+        for name in ordered:
+            j = judge_lookup.get(name, {})
+            fill = tier_colors.get(tier, PatternFill())
+            for col, val in enumerate([global_rank, name, j.get("school", ""),
+                                        j.get("rounds", 0), f"Tier {tier}"], 1):
+                cell = ws.cell(row=row, column=col, value=val)
+                cell.fill = fill
+                cell.border = thin_border
+                if col == 1:
+                    cell.alignment = Alignment(horizontal="center")
+            row += 1
+            global_rank += 1
+
+    # Strikes
+    strike_names = sorted(n for n, s in session.scores_map.items() if s == 6.0)
+    for name in strike_names:
+        j = judge_lookup.get(name, {})
+        fill = tier_colors[6]
+        for col, val in enumerate(["S", name, j.get("school", ""),
+                                    j.get("rounds", 0), "Strike"], 1):
+            cell = ws.cell(row=row, column=col, value=val)
+            cell.fill = fill
+            cell.border = thin_border
+            if col == 1:
+                cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    # Conflicts
+    conflict_names = sorted(n for n, s in session.scores_map.items() if s == 7.0)
+    for name in conflict_names:
+        j = judge_lookup.get(name, {})
+        fill = tier_colors[7]
+        for col, val in enumerate(["C", name, j.get("school", ""),
+                                    j.get("rounds", 0), "Conflict"], 1):
+            cell = ws.cell(row=row, column=col, value=val)
+            cell.fill = fill
+            cell.border = thin_border
+            if col == 1:
+                cell.alignment = Alignment(horizontal="center")
+        row += 1
+
+    # Write to bytes
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    file = discord.File(buf, filename="ordinal_rankings.xlsx")
+
+    total_ranked = global_rank - 1
+    embed = discord.Embed(
+        title="✅ Ordinal Rankings Complete!",
+        description=f"**{total_ranked}** judges ranked, "
+                    f"**{len(strike_names)}** strikes, "
+                    f"**{len(conflict_names)}** conflicts.\n"
+                    "Here's your ordinal ranking sheet.",
+        color=SUCCESS_COLOR)
+    await channel.send(embed=embed, file=file)
+    session.state = "done"
+    sessions.pop(channel.id, None)
+
+
+# ---------------------------------------------------------------------------
 # Quota Views
 # ---------------------------------------------------------------------------
 
@@ -923,12 +1616,18 @@ async def on_message(message: discord.Message):
         if any(kw in content for kw in ("pref", "judge", "rank", "tournament", "hello", "hi")):
             session = PrefSession(channel_id, message.author.id)
             sessions[channel_id] = session
-            # If CSV attached with the command, process it immediately
+            # Check for a progress file (.xlsx) to resume from
+            xlsx_attachment = None
             csv_attachment = None
             for att in message.attachments:
-                if att.filename.endswith(".csv"):
+                if att.filename.endswith(".xlsx"):
+                    xlsx_attachment = att
+                elif att.filename.endswith(".csv"):
                     csv_attachment = att
-                    break
+            if xlsx_attachment:
+                await _resume_from_file(message, session, xlsx_attachment)
+                return
+            # If CSV attached with the command, process it immediately
             if csv_attachment:
                 csv_bytes = await csv_attachment.read()
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb")
@@ -949,7 +1648,8 @@ async def on_message(message: discord.Message):
                     title="📋 Prefessor Judge",
                     description="Let's do prefs! Upload the tournament judge CSV file.\n\n"
                                 "Expected columns: `Name, School, Rounds, Your Rating`\n"
-                                "(or `First, Last, School, Online, Rounds, Rating`)",
+                                "(or `First, Last, School, Online, Rounds, Rating`)\n\n"
+                                "💾 **Resuming?** Upload a `.xlsx` progress file instead.",
                     color=EMBED_COLOR)
                 embed.set_footer(text="Type 'cancel' at any time to abort.")
                 await message.channel.send(embed=embed)
@@ -995,6 +1695,22 @@ async def on_message(message: discord.Message):
             await message.channel.send(content="▶️ Resuming scoring…", embed=embed, view=view)
             para_embed = _build_paradigm_embed(judge, session)
             await _update_paradigms(message.channel, session, [para_embed])
+        elif session.state == "ordinal_bucketing" and session.current_idx < len(session.unmatched):
+            await message.channel.send(content="▶️ Resuming tier bucketing…")
+            await _send_ordinal_bucket(message.channel, session)
+        elif session.state == "ordinal_refining" and session.ranker and not session.ranker.is_complete:
+            tier = session.ordinal_refine_tier or "?"
+            info_embeds, para_embeds = _build_comparison_embeds(session)
+            view = OrdinalPairwiseView(session)
+            await _update_paradigms(message.channel, session, para_embeds)
+            await message.channel.send(
+                content=f"▶️ Resuming Tier {tier} refinement — "
+                        f"{session.ranker.remaining} comparisons left.",
+                embeds=info_embeds, view=view)
+        elif session.state == "ordinal_refine_prompt":
+            embed = _build_ordinal_summary_embed(session)
+            view = OrdinalRefinePromptView(session)
+            await message.channel.send(embed=embed, view=view)
         else:
             await message.channel.send(embed=discord.Embed(
                 description=f"Current state: **{session.state}** — nothing to resume. Send your input to continue.",
@@ -1020,12 +1736,17 @@ async def handle_state(message: discord.Message, session: PrefSession):
     if session.state == "awaiting_csv":
         if not message.attachments:
             await channel.send(embed=discord.Embed(
-                description="Please upload a CSV file to continue.", color=WARN_COLOR))
+                description="Please upload a CSV file (or an `.xlsx` progress file to resume).",
+                color=WARN_COLOR))
             return
         attachment = message.attachments[0]
+        if attachment.filename.endswith(".xlsx"):
+            await _resume_from_file(message, session, attachment)
+            return
         if not attachment.filename.endswith(".csv"):
             await channel.send(embed=discord.Embed(
-                description="That doesn't look like a CSV. Please upload a `.csv` file.", color=ERROR_COLOR))
+                description="That doesn't look like a CSV or progress file. "
+                            "Please upload a `.csv` or `.xlsx` file.", color=ERROR_COLOR))
             return
         csv_bytes = await attachment.read()
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb")
@@ -1141,6 +1862,40 @@ async def handle_state(message: discord.Message, session: PrefSession):
                 title="📋 Prefessor Judge — New Session",
                 description="Upload a tournament CSV to begin.", color=EMBED_COLOR))
 
+    # --- Ordinal states (button-driven, text fallback) ---
+    elif session.state in ("ordinal_bulk_strike", "ordinal_bucketing",
+                           "ordinal_refine_prompt", "ordinal_refining"):
+        text = message.content.strip().lower()
+        if session.state == "ordinal_refining" and session.ranker:
+            pair = session.ranker.next_pair()
+            if not pair:
+                await _finish_ordinal_tier_refine(channel, session)
+                return
+            judge_a, judge_b = pair
+            if text == "a":
+                session.ranker.record_result(judge_a, judge_b)
+            elif text == "b":
+                session.ranker.record_result(judge_b, judge_a)
+            elif text in ("skip", "s"):
+                session.ranker.skip_pair()
+            elif text in ("done", "stop"):
+                await _finish_ordinal_tier_refine(channel, session)
+                return
+            else:
+                await channel.send("Type **A**, **B**, **skip**, or **done**:")
+                return
+            if session.ranker.is_complete:
+                await _finish_ordinal_tier_refine(channel, session)
+            else:
+                info_embeds, para_embeds = _build_comparison_embeds(session)
+                view = OrdinalPairwiseView(session)
+                await channel.send(embeds=info_embeds, view=view)
+                await _update_paradigms(channel, session, para_embeds)
+        else:
+            await channel.send(embed=discord.Embed(
+                description="Please use the buttons above to continue.",
+                color=WARN_COLOR))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1168,6 +1923,109 @@ async def _update_paradigms(channel, session: PrefSession, para_embeds: list):
             await session.paradigm_messages.pop().delete()
         except Exception:
             pass
+
+
+async def _resume_from_file(message: discord.Message, session: PrefSession,
+                            attachment: discord.Attachment):
+    """Load a progress .xlsx file and resume the session from where it left off."""
+    channel = message.channel
+    try:
+        file_bytes = await attachment.read()
+        data = load_progress(file_bytes)
+        restore_session(session, data)
+    except Exception as e:
+        await channel.send(embed=discord.Embed(
+            title="❌ Failed to Load Progress",
+            description=f"Could not read the progress file: {e}",
+            color=ERROR_COLOR))
+        session.state = "awaiting_csv"
+        return
+
+    total_judges = len(session.csv_judges)
+    scored = len(session.scores_map)
+    embed = discord.Embed(
+        title="💾 Progress Restored",
+        description=f"Loaded **{total_judges}** judges from `{attachment.filename}`.\n"
+                    f"**{scored}** judge(s) already scored.\n"
+                    f"Resuming from state: **{session.state}**",
+        color=SUCCESS_COLOR)
+    await channel.send(embed=embed)
+
+    # Resume into the correct state
+    if session.state == "comparing" and session.ranker and not session.ranker.is_complete:
+        info_embeds, para_embeds = _build_comparison_embeds(session)
+        view = PairwiseView(session)
+        await channel.send(
+            content=f"▶️ Resuming pairwise — **{session.ranker.remaining}** comparisons left.",
+            embeds=info_embeds, view=view)
+        await _update_paradigms(channel, session, para_embeds)
+
+    elif session.state == "prompting_scores" and session.current_idx < len(session.unmatched):
+        judge = session.unmatched[session.current_idx]
+        total = len(session.unmatched)
+        idx = session.current_idx + 1
+        embed = discord.Embed(title=f"Judge {idx}/{total} — {judge['name']}", color=EMBED_COLOR)
+        embed.add_field(name="🏫 School", value=judge.get("school") or "Unknown", inline=True)
+        embed.add_field(name="🔄 Rounds", value=str(judge.get("rounds", "?")), inline=True)
+        embed.set_footer(text=f"Progress: {idx}/{total}")
+        view = ScoringView(session)
+        await channel.send(content="▶️ Resuming scoring…", embed=embed, view=view)
+        para_embed = _build_paradigm_embed(judge, session)
+        await _update_paradigms(channel, session, [para_embed])
+
+    elif session.state == "reviewing":
+        review_view = ReviewView(session)
+        embed = review_view.build_summary_embed()
+        await channel.send(embed=embed, view=review_view)
+
+    elif session.state == "awaiting_quota_mode":
+        await send_quota_mode_prompt(channel, session)
+
+    elif session.state == "awaiting_quotas":
+        unit = "judges" if session.quota_mode == "judges" else "rounds"
+        embed = discord.Embed(
+            title="📝 Tier Quotas",
+            description=f"Enter **minimum {unit}** for each tier in one line:\n"
+                        f"```\nTier1  Tier2  Tier3  Tier4  Tier5  Strike\n```\n"
+                        f"Use `-` to skip a tier. Use `min,max` for a range.\n\n"
+                        f"**Example:** `6 8 10 8 6 -`",
+            color=EMBED_COLOR)
+        await channel.send(embed=embed)
+
+    elif session.state == "awaiting_source_choice":
+        await _send_source_choice(channel, session)
+
+    elif session.state == "awaiting_unmatched_choice":
+        await _send_unmatched_prompt(channel, session)
+
+    elif session.state == "awaiting_rating_range":
+        await _send_rating_range_prompt(channel, session)
+
+    elif session.state == "ordinal_bulk_strike":
+        await _send_ordinal_bulk_strike(channel, session)
+
+    elif session.state == "ordinal_bucketing":
+        await _send_ordinal_bucket(channel, session)
+
+    elif session.state == "ordinal_refine_prompt":
+        embed = _build_ordinal_summary_embed(session)
+        view = OrdinalRefinePromptView(session)
+        await channel.send(embed=embed, view=view)
+
+    elif session.state == "ordinal_refining" and session.ranker and not session.ranker.is_complete:
+        tier = session.ordinal_refine_tier or "?"
+        info_embeds, para_embeds = _build_comparison_embeds(session)
+        view = OrdinalPairwiseView(session)
+        await channel.send(
+            content=f"▶️ Resuming Tier {tier} refinement — "
+                    f"**{session.ranker.remaining}** comparisons left.",
+            embeds=info_embeds, view=view)
+        await _update_paradigms(channel, session, para_embeds)
+
+    else:
+        await channel.send(embed=discord.Embed(
+            description=f"Restored to state: **{session.state}**. Send your input to continue.",
+            color=EMBED_COLOR))
 
 
 async def _send_rating_range_prompt(channel, session: PrefSession):
@@ -1305,6 +2163,10 @@ class UnmatchedChoiceView(ui.View):
     async def pairwise(self, interaction: discord.Interaction, button: ui.Button):
         await self._handle(interaction, "compare")
 
+    @ui.button(label="Ordinal Ranking", style=discord.ButtonStyle.primary, emoji="📊")
+    async def ordinal(self, interaction: discord.Interaction, button: ui.Button):
+        await self._handle(interaction, "ordinal")
+
     @ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭️")
     async def skip(self, interaction: discord.Interaction, button: ui.Button):
         await self._handle(interaction, "skip")
@@ -1384,6 +2246,25 @@ class UnmatchedChoiceView(ui.View):
             await channel.send(embeds=info_embeds, view=view)
             await _update_paradigms(channel, session, para_embeds)
 
+        elif choice == "ordinal":
+            session.ordinal_mode = True
+            # In ordinal mode, ALL judges need bucketing (matched + unmatched)
+            all_to_bucket = list(session.csv_judges)
+            session.unmatched = all_to_bucket
+            session.current_idx = 0
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="📊 Starting ordinal ranking…", color=EMBED_COLOR),
+                view=None)
+            if tabroom_scraper and tabroom_cache:
+                loading = await channel.send(embed=discord.Embed(
+                    description="🌐 Fetching Tabroom paradigms…", color=EMBED_COLOR))
+                for j in session.unmatched:
+                    session.paradigms[j["name"]] = tabroom_cache.get_or_fetch(j["name"], tabroom_scraper)
+                await loading.delete()
+            # Start with bulk strike/conflict
+            session.state = "ordinal_bulk_strike"
+            await _send_ordinal_bulk_strike(channel, session)
+
         else:  # skip
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -1407,9 +2288,11 @@ async def _send_source_choice(channel, session: PrefSession):
 
 async def _send_unmatched_prompt(channel, session: PrefSession):
     embed = discord.Embed(
-        title="❓ Unmatched Judges",
-        description=f"**{len(session.unmatched)}** judge(s) not found in the database.\n"
-                    "How would you like to handle them?",
+        title="❓ Judges to Rate",
+        description=f"**{len(session.unmatched)}** judge(s) need ratings.\n"
+                    "How would you like to handle them?\n\n"
+                    "📊 **Ordinal Ranking** — bucket into tiers, then refine within each tier "
+                    "via pairwise comparison. Exports a ranked Excel file (no quotas).",
         color=WARN_COLOR)
     view = UnmatchedChoiceView(session)
     await channel.send(embed=embed, view=view)
