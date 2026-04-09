@@ -1330,8 +1330,30 @@ async def _show_ordinal_bucket_judge(interaction: discord.Interaction,
     await _update_paradigms(interaction.channel, session, [para_embed])
 
 
+def _build_tier_csv(session: PrefSession) -> io.BytesIO:
+    """Build a CSV of all judges with their tier assignments."""
+    output = io.StringIO()
+    writer = csv_mod.writer(output)
+    writer.writerow(["First", "Last", "School", "Rounds", "Tier"])
+    for tier in range(1, 6):
+        names = [j["name"] for j in session.csv_judges
+                 if session.scores_map.get(j["name"]) == float(tier)]
+        for name in sorted(names):
+            j = next((x for x in session.csv_judges if x["name"] == name), {})
+            first, last = split_name(name)
+            writer.writerow([first, last, j.get("school", ""), j.get("rounds", 0), tier])
+    for label, score_val in [("S", 6.0), ("C", 7.0)]:
+        names = sorted(n for n, s in session.scores_map.items() if s == score_val)
+        for name in names:
+            j = next((x for x in session.csv_judges if x["name"] == name), {})
+            first, last = split_name(name)
+            writer.writerow([first, last, j.get("school", ""), j.get("rounds", 0), label])
+    output.seek(0)
+    return io.BytesIO(output.getvalue().encode("utf-8"))
+
+
 async def _finish_ordinal_bucketing(interaction: discord.Interaction, session: PrefSession):
-    """Transition from bucketing to the refine prompt."""
+    """Transition from bucketing to the refine prompt, exporting tier CSV."""
     # Clean up paradigm messages
     for msg in session.paradigm_messages:
         try:
@@ -1340,10 +1362,18 @@ async def _finish_ordinal_bucketing(interaction: discord.Interaction, session: P
             pass
     session.paradigm_messages.clear()
 
+    # Export tier CSV
+    csv_buf = _build_tier_csv(session)
+    file = discord.File(csv_buf, filename="tier_assignments.csv")
+    await interaction.response.edit_message(
+        embed=discord.Embed(description="💾 Tier bucketing complete — CSV exported.",
+                            color=SUCCESS_COLOR), view=None)
+    await interaction.channel.send(file=file)
+
     session.state = "ordinal_refine_prompt"
     embed = _build_ordinal_summary_embed(session)
     view = OrdinalRefinePromptView(session)
-    await interaction.response.edit_message(embed=embed, view=view)
+    await interaction.channel.send(embed=embed, view=view)
 
 
 async def _finish_ordinal_bucketing_from_channel(channel, session: PrefSession):
@@ -1354,6 +1384,11 @@ async def _finish_ordinal_bucketing_from_channel(channel, session: PrefSession):
         except Exception:
             pass
     session.paradigm_messages.clear()
+
+    # Export tier CSV
+    csv_buf = _build_tier_csv(session)
+    file = discord.File(csv_buf, filename="tier_assignments.csv")
+    await channel.send(file=file)
 
     session.state = "ordinal_refine_prompt"
     embed = _build_ordinal_summary_embed(session)
