@@ -25,7 +25,7 @@ from name_matcher import match_judges
 from tier_assigner import assign_tiers, format_report
 from csv_writer import write_output_csv
 from pairwise_ranker import PairwiseRanker
-from progress_saver import save_progress, load_progress, restore_session
+from progress_saver import save_progress, load_progress, restore_session, is_progress_file
 
 try:
     from judge_scraper import TabroomScraper
@@ -1625,8 +1625,12 @@ async def on_message(message: discord.Message):
                 elif att.filename.endswith(".csv"):
                     csv_attachment = att
             if xlsx_attachment:
-                await _resume_from_file(message, session, xlsx_attachment)
-                return
+                xlsx_bytes = await xlsx_attachment.read()
+                if is_progress_file(xlsx_bytes):
+                    await _resume_from_file(message, session, xlsx_attachment, file_bytes=xlsx_bytes)
+                    return
+                # Not a progress file — treat as regular attachment, fall through to CSV check
+                xlsx_attachment = None
             # If CSV attached with the command, process it immediately
             if csv_attachment:
                 csv_bytes = await csv_attachment.read()
@@ -1741,7 +1745,15 @@ async def handle_state(message: discord.Message, session: PrefSession):
             return
         attachment = message.attachments[0]
         if attachment.filename.endswith(".xlsx"):
-            await _resume_from_file(message, session, attachment)
+            xlsx_bytes = await attachment.read()
+            if is_progress_file(xlsx_bytes):
+                await _resume_from_file(message, session, attachment, file_bytes=xlsx_bytes)
+                return
+            # Not a progress file — tell user to upload CSV
+            await channel.send(embed=discord.Embed(
+                description="That `.xlsx` file doesn't look like a saved progress file.\n"
+                            "Please upload a `.csv` tournament file or a valid progress file.",
+                color=ERROR_COLOR))
             return
         if not attachment.filename.endswith(".csv"):
             await channel.send(embed=discord.Embed(
@@ -1926,11 +1938,12 @@ async def _update_paradigms(channel, session: PrefSession, para_embeds: list):
 
 
 async def _resume_from_file(message: discord.Message, session: PrefSession,
-                            attachment: discord.Attachment):
+                            attachment: discord.Attachment, *, file_bytes: bytes | None = None):
     """Load a progress .xlsx file and resume the session from where it left off."""
     channel = message.channel
     try:
-        file_bytes = await attachment.read()
+        if file_bytes is None:
+            file_bytes = await attachment.read()
         data = load_progress(file_bytes)
         restore_session(session, data)
     except Exception as e:

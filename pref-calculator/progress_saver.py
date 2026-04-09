@@ -261,6 +261,28 @@ def save_progress(session, filename="prefs_progress.xlsx"):
     return buf.getvalue(), filename
 
 
+def is_progress_file(file_bytes):
+    """Check if an Excel file is a Prefessor Judge progress file.
+
+    Returns True only if the workbook contains the expected 'Session Info' sheet
+    with recognizable metadata fields.
+    """
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        if "Session Info" not in wb.sheetnames:
+            wb.close()
+            return False
+        ws = wb["Session Info"]
+        fields = set()
+        for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+            if row[0]:
+                fields.add(str(row[0]))
+        wb.close()
+        return "State" in fields and "Rating Max" in fields
+    except Exception:
+        return False
+
+
 def load_progress(file_bytes):
     """Deserialize an Excel progress file back into session data.
 
