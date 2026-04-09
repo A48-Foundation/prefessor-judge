@@ -2261,12 +2261,23 @@ class UnmatchedChoiceView(ui.View):
 
         elif choice == "ordinal":
             session.ordinal_mode = True
-            # In ordinal mode, ALL judges need bucketing (matched + unmatched)
-            all_to_bucket = list(session.csv_judges)
-            session.unmatched = all_to_bucket
+            # Only bucket judges who don't already have a rating
+            already_scored = set(session.scores_map.keys())
+            # Also count matched judges with Notion scores as already scored
+            for csv_j, notion_name, notion_score in session.matched:
+                if notion_score is not None:
+                    session.scores_map[csv_j["name"]] = notion_score
+                    already_scored.add(csv_j["name"])
+            to_bucket = [j for j in session.csv_judges if j["name"] not in already_scored]
+            session.unmatched = to_bucket
             session.current_idx = 0
+            pre_rated = len(already_scored)
+            desc = f"📊 Starting ordinal ranking…\n"
+            if pre_rated:
+                desc += f"📋 **{pre_rated}** judge(s) already have ratings (kept as-is).\n"
+            desc += f"**{len(to_bucket)}** judge(s) still need tier assignments."
             await interaction.response.edit_message(
-                embed=discord.Embed(description="📊 Starting ordinal ranking…", color=EMBED_COLOR),
+                embed=discord.Embed(description=desc, color=EMBED_COLOR),
                 view=None)
             if tabroom_scraper and tabroom_cache:
                 loading = await channel.send(embed=discord.Embed(
