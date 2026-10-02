@@ -2,7 +2,7 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "cd pref-calculator && python main.py"
+startCommand = "bash -c 'if [ -d pref-calculator ]; then cd pref-calculator; fi; python main.py'"
 healthcheckPath = ""
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
